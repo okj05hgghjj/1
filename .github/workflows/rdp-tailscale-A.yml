@@ -7,7 +7,7 @@ on:
       ts_api_key:        { description: "Tailscale API key (device admin, no 'Bearer')", required: true }
       ts_authkey:        { description: "Tailscale Auth key (reusable or ephemeral)", required: true }
       tools_zip_url:
-        description: "DIRECT .zip link (e.g. https://storeN.gofile.io/download/direct/.../tools.zip)"
+        description: "GoFile /d/<id> page OR direct .zip link"
         required: false
         default: ""
       quick_test:
@@ -64,45 +64,73 @@ jobs:
     steps:
       - name: Decide hostname
         run: |
-          if ([int]"${{ inputs.rdp_count }}" -gt 1) {
-            $env:TS_HOSTNAME = "bullet${{ matrix.id }}"
-          } else {
-            $env:TS_HOSTNAME = "bullet"
-          }
+          if ([int]"${{ inputs.rdp_count }}" -gt 1) { $env:TS_HOSTNAME = "bullet${{ matrix.id }}" } else { $env:TS_HOSTNAME = "bullet" }
           "TS_HOSTNAME=$env:TS_HOSTNAME" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Download & extract tools ZIP (DIRECT link only)
+      # >>> OPTION B: Accept GoFile /d/<id> page OR direct .zip and auto-resolve
+      - name: Download & extract tools ZIP (GoFile page OR direct)
         run: |
           $url = "${{ inputs.tools_zip_url }}".Trim()
-          if (-not [string]::IsNullOrWhiteSpace($url)) {
-            if ($url -notmatch '\.zip(\?|$)') {
-              throw "tools_zip_url must be a DIRECT .zip link; got: $url"
-            }
-            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-            $tmp  = "$env:RUNNER_TEMP\tools.zip"
-            $out  = "C:\Tools"
-            New-Item -Force -ItemType Directory $out | Out-Null
-            try {
-              Invoke-WebRequest -Uri $url -OutFile $tmp -UseBasicParsing -MaximumRedirection 10 -Headers @{ "User-Agent"="curl/8.4" }
-            } catch {
-              throw "Download failed for tools_zip_url: $url — $($_.Exception.Message)"
-            }
-            if (-not (Test-Path $tmp) -or (Get-Item $tmp).Length -lt 1048576) {
-              throw "Downloaded file is missing or too small — check that the link is a DIRECT .zip download."
-            }
-            Expand-Archive -Path $tmp -DestinationPath $out -Force
-            Write-Host "Tools unpacked to $out"
-
-            # Desktop shortcuts for instant use
-            $desktop = "C:\Users\Public\Desktop"
-            $wsh = New-Object -ComObject WScript.Shell
-            $rust = Get-ChildItem -Path $out -Recurse -Filter "rustdesk*.exe" | Sort-Object Length -Descending | Select-Object -First 1
-            if ($rust) { $lnk = $wsh.CreateShortcut((Join-Path $desktop "RustDesk (portable).lnk")); $lnk.TargetPath = $rust.FullName; $lnk.Save() }
-            $ff = Get-ChildItem -Path $out -Recurse -Filter "firefox.exe" | Where-Object { $_.FullName -match 'FirefoxNightly' } | Select-Object -First 1
-            if ($ff) { $lnk2 = $wsh.CreateShortcut((Join-Path $desktop "Firefox Nightly (portable).lnk")); $lnk2.TargetPath = $ff.FullName; $lnk2.Save() }
-          } else {
+          if ([string]::IsNullOrWhiteSpace($url)) {
             Write-Host "tools_zip_url not provided; skipping tools bundle."
+            exit 0
           }
+
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          $tmp  = "$env:RUNNER_TEMP\tools.zip"
+          $out  = "C:\Tools"
+          New-Item -Force -ItemType Directory $out | Out-Null
+
+          function Download-Zip([string]$u){
+            try {
+              Invoke-WebRequest -Uri $u -OutFile $tmp -UseBasicParsing -MaximumRedirection 10 -Headers @{ "User-Agent"="curl/8.4" }
+              return $true
+            } catch {
+              Write-Host "Download failed: $($_.Exception.Message)"; return $false
+            }
+          }
+
+          $ok = $false
+          if ($url -match '\.zip(\?|$)') {
+            $ok = Download-Zip $url
+          } elseif ($url -match 'https?://(www\.)?gofile\.io/d/([A-Za-z0-9]+)') {
+            $id = $Matches[2]
+            try {
+              # Public API resolve (folder must be public)
+              $api = "https://api.gofile.io/getContent?contentId=$id&websiteToken=12345"
+              $j = Invoke-RestMethod -Uri $api -UseBasicParsing -Headers @{ "User-Agent"="curl/8.4" }
+              if ($j.status -eq "ok") {
+                $file = $j.data.children | Where-Object { $_.type -eq "file" -and $_.name -match '\.zip$' } | Select-Object -First 1
+                if ($file -and $file.directLink) {
+                  Write-Host "Resolved direct link: $($file.directLink)"
+                  $ok = Download-Zip $file.directLink
+                } else {
+                  throw "No .zip file found in GoFile folder $id."
+                }
+              } else {
+                throw "GoFile API status: $($j.status)"
+              }
+            } catch {
+              throw "GoFile resolve failed for $url — $($_.Exception.Message)"
+            }
+          } else {
+            throw "tools_zip_url must be a direct .zip link or a GoFile /d/<id> page; got: $url"
+          }
+
+          if (-not $ok -or -not (Test-Path $tmp) -or (Get-Item $tmp).Length -lt 1048576) {
+            throw "Downloaded file missing/too small — ensure link is valid."
+          }
+
+          Expand-Archive -Path $tmp -DestinationPath $out -Force
+          Write-Host "Tools unpacked to $out"
+
+          # Shortcuts (if found)
+          $desktop = "C:\Users\Public\Desktop"
+          $wsh = New-Object -ComObject WScript.Shell
+          $rust = Get-ChildItem -Path $out -Recurse -Filter "rustdesk*.exe" | Sort-Object Length -Descending | Select-Object -First 1
+          if ($rust) { $lnk = $wsh.CreateShortcut((Join-Path $desktop "RustDesk (portable).lnk")); $lnk.TargetPath = $rust.FullName; $lnk.Save() }
+          $ff = Get-ChildItem -Path $out -Recurse -Filter "firefox.exe" | Where-Object { $_.FullName -match 'FirefoxNightly' } | Select-Object -First 1
+          if ($ff) { $lnk2 = $wsh.CreateShortcut((Join-Path $desktop "Firefox Nightly (portable).lnk")); $lnk2.TargetPath = $ff.FullName; $lnk2.Save() }
 
       - name: Setup Tailscale + RDP
         run: |
