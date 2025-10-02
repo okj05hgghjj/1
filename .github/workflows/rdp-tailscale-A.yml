@@ -148,7 +148,6 @@ jobs:
           $ProgressPreference = "SilentlyContinue"
 
           function Find-RustDesk {
-            # 1) Known install paths
             $candidates = @(
               (Join-Path $env:ProgramFiles    "RustDesk\rustdesk.exe"),
               (Join-Path $env:ProgramFilesx86 "RustDesk\rustdesk.exe"),
@@ -156,7 +155,6 @@ jobs:
             ) | Where-Object { $_ -and (Test-Path $_) }
             if ($candidates) { return $candidates[0] }
 
-            # 2) Registry (64 & 32-bit)
             $regKeys = @(
               'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
               'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
@@ -175,7 +173,6 @@ jobs:
               }
             }
 
-            # 3) Shallow search (depth 2)
             $roots = @()
             if ($env:ProgramFiles)    { $roots += $env:ProgramFiles }
             if ($env:ProgramFilesx86) { $roots += $env:ProgramFilesx86 }
@@ -189,63 +186,50 @@ jobs:
           }
 
           $exe = Find-RustDesk
-          if (-not $exe) {
-            Write-Host "RustDesk not found on disk (maybe install failed)."
+          if (-not $exe) { Write-Host "RustDesk not found on disk."; exit 0 }
+
+          if (Get-Process -Name rustdesk -ErrorAction SilentlyContinue) {
+            Write-Host "RustDesk already running."
             exit 0
           }
 
-          # If already running, don't launch again
-          $existing = Get-Process -Name rustdesk -ErrorAction SilentlyContinue
-          if ($existing) {
-            Write-Host ("RustDesk already running (PID(s): {0})." -f ($existing.Id -join ','))
-            exit 0
-          }
-
-          # Launch without waiting; visible window for screenshot
           $psi = New-Object System.Diagnostics.ProcessStartInfo
           $psi.FileName = $exe
           $psi.WorkingDirectory = Split-Path $exe
           $psi.UseShellExecute = $true
           $proc = [System.Diagnostics.Process]::Start($psi)
+          if ($proc) { Write-Host ("RustDesk launched PID {0}" -f $proc.Id); Start-Sleep -Seconds 5 } else { Write-Host "Launch failed." }
 
-          if ($proc) {
-            Write-Host ("RustDesk launched: {0} (PID {1})" -f $exe, $proc.Id)
-            Start-Sleep -Seconds 5
-          } else {
-            Write-Host "Failed to start RustDesk (no exception thrown)."
-          }
-
-      - name: Prepare desktop (hide Tailscale UI, focus RustDesk)
+      - name: Prepare desktop (hide Tailscale UI, focus RustDesk via COM)
         run: |
           $ErrorActionPreference = "SilentlyContinue"
 
-          # Close only the Tailscale UI (service stays running)
+          # Close Tailscale UI window (service keeps running)
           Stop-Process -Name "Tailscale" -Force -ErrorAction SilentlyContinue
 
-          # Bring RustDesk to foreground & maximize (if it has a main window)
-          Add-Type @"
-          using System;
-          using System.Runtime.InteropServices;
-          public static class Win32 {
-            [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
-            [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
-          }
-"@
-
+          # Focus & maximize RustDesk using WScript.Shell (YAML-safe; no here-strings)
           $rd = $null
           for ($i=0; $i -lt 15; $i++) {
             $rd = Get-Process -Name rustdesk -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($rd -and $rd.MainWindowHandle -ne 0) { break }
+            if ($rd -and $rd.MainWindowTitle) { break }
             Start-Sleep -Seconds 1
           }
 
-          if ($rd -and $rd.MainWindowHandle -ne 0) {
-            [Win32]::ShowWindowAsync($rd.MainWindowHandle, 3) | Out-Null  # SW_MAXIMIZE
-            [Win32]::SetForegroundWindow($rd.MainWindowHandle) | Out-Null
-            Write-Host ("RustDesk focused & maximized (PID {0})." -f $rd.Id)
-            Start-Sleep -Seconds 2
-          } else {
-            Write-Host "Warning: RustDesk main window not found; proceeding with screenshot anyway."
+          try {
+            $ws = New-Object -ComObject WScript.Shell
+            if ($rd) {
+              $null = $ws.AppActivate($rd.Id)    # Activate by PID
+              Start-Sleep -Milliseconds 400
+              $ws.SendKeys('% ')                 # ALT+SPACE
+              Start-Sleep -Milliseconds 200
+              $ws.SendKeys('x')                  # Maximize
+              Start-Sleep -Seconds 2
+              Write-Host "RustDesk focused & maximized."
+            } else {
+              Write-Host "Warning: RustDesk process/window not found; continuing."
+            }
+          } catch {
+            Write-Host "Focus error (non-fatal): $($_.Exception.Message)"
           }
 
       - name: Take full-screen screenshot (RustDesk only)
