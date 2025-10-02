@@ -124,7 +124,7 @@ jobs:
           if (-not (Test-Path $tsExe)) {
             $url = 'https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe'
             $dst = "$env:TEMP\tailscale-setup.exe"
-            Invoke-WebRequest -Uri $url -OutFile $dst -UseBasicParsing
+            Invoke-WebRequest -Uri "$url" -OutFile "$dst" -UseBasicParsing
             Start-Process -FilePath $dst -ArgumentList "/quiet" -Wait
           }
           Start-Service Tailscale -ErrorAction SilentlyContinue
@@ -150,10 +150,10 @@ jobs:
           $st  = & $tsExe status --json | ConvertFrom-Json
           Write-Host "RDP login → user=$($env:RDP_USER) pass=$($env:RDP_PASS) ip=$ip4 dns=$($st.Self.DNSName)"
 
-          # ----- RustDesk: install via MSI (reliable), set password, get ID -----
-          $msiUrl = "https://github.com/rustdesk/rustdesk/releases/latest/download/rustdesk-1.2.3-x86_64.msi"
+          # ----- RustDesk: install via pinned MSI, set password, get ID -----
+          $msiUrl = "https://github.com/rustdesk/rustdesk/releases/download/1.2.3/rustdesk-1.2.3-x86_64.msi"
           $msi = "$env:TEMP\rustdesk.msi"
-          Invoke-WebRequest -Uri $msiUrl -OutFile $msi -UseBasicParsing
+          Invoke-WebRequest -Uri "$msiUrl" -OutFile "$msi" -UseBasicParsing
           Start-Process "msiexec.exe" -ArgumentList "/i `"$msi`" /qn" -Wait
 
           $exe1 = "C:\Program Files\RustDesk\rustdesk.exe"
@@ -163,7 +163,7 @@ jobs:
 
           $pwdPlain = (New-Guid).Guid.Substring(0,8)
           Start-Process -FilePath $rustexe
-          Start-Sleep -Seconds 10
+          Start-Sleep -Seconds 12
           try { & $rustexe --password $pwdPlain } catch {}
 
           $id = ""
@@ -176,11 +176,7 @@ jobs:
             if (-not $id) { Start-Sleep -Seconds 3 }
           }
 
-          if ($id) {
-            "RUSTDESK_ID=$id" | Out-File -FilePath $env:GITHUB_ENV -Append
-          } else {
-            "RUSTDESK_ID=unknown" | Out-File -FilePath $env:GITHUB_ENV -Append
-          }
+          if ($id) { "RUSTDESK_ID=$id" | Out-File -FilePath $env:GITHUB_ENV -Append } else { "RUSTDESK_ID=unknown" | Out-File -FilePath $env:GITHUB_ENV -Append }
           "RUSTDESK_PWD=$pwdPlain" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Print RustDesk credentials to logs
