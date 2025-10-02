@@ -1,10 +1,10 @@
-name: RDP via Tailscale + RustDesk (Workflow A)
+name: "RDP via Tailscale + RustDesk (Workflow A)"
 
 on:
   workflow_dispatch:
     inputs:
       ts_tailnet:
-        description: "Tailscale tailnet (example: you@gmail.com)"
+        description: "Tailscale tailnet (e.g. you@gmail.com)"
         required: true
       ts_api_key:
         description: "Tailscale API key (device admin, no 'Bearer')"
@@ -12,99 +12,280 @@ on:
       ts_authkey:
         description: "Tailscale Auth key (reusable or ephemeral)"
         required: true
-      runtime_minutes:
-        description: "Runtime (max 355)"
-        required: false
-        default: "355"
-      test_mode:
-        description: "Run only 5 minutes (for testing)"
+      quick_test:
+        description: "Run 5-minute quick test"
         type: boolean
         default: false
+      runtime_minutes:
+        description: "Runtime (max 360; default 355 if not test)"
+        required: false
+        default: "355"
+      do_purge:
+        description: "Purge bullet* at start"
+        required: false
+        default: "true"
+      cycles:
+        description: "0 = stop after A; N = handoffs left incl. this run"
+        required: false
+        default: "0"
+      rdp_count:
+        description: "How many RDP instances? 1=normal, 2–10=multi"
+        required: false
+        default: "1"
+
+permissions:
+  contents: read
+  actions: write
+
+defaults:
+  run:
+    shell: pwsh
 
 jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.eval.outputs.matrix }}
+    steps:
+      - id: eval
+        run: |
+          $count = [int]"${{ inputs.rdp_count }}"
+          if ($count -lt 1) { $count = 1 }
+          if ($count -gt 10) { $count = 10 }
+          $inc=@(); for ($i=1; $i -le $count; $i++){ $inc+=@{id=$i} }
+          $json=@{include=$inc}|ConvertTo-Json -Compress
+          "matrix=$json" | Out-File $env:GITHUB_OUTPUT -Append
+
   rdp:
-    runs-on: windows-latest
-    timeout-minutes: 360
+    needs: setup
+    runs-on: windows-2025
+    strategy:
+      matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
+      max-parallel: 10
+    timeout-minutes: 370
+    env:
+      RDP_USER:    Bullettemporary
+      RDP_PASS:    Bullet@12345
 
     steps:
-    - name: Setup hostname
-      id: setup
-      shell: pwsh
-      run: |
-        $runtime = [int]("${{ github.event.inputs.runtime_minutes }}")
-        if ("${{ github.event.inputs.test_mode }}" -eq "true") { $runtime = 5 }
-        echo "RUNTIME=$runtime" | Out-File -FilePath $env:GITHUB_ENV -Append
-        echo "HOSTNAME=bullet" | Out-File -FilePath $env:GITHUB_ENV -Append
-        echo "USER=Bullettemporary" | Out-File -FilePath $env:GITHUB_ENV -Append
-        echo "PASS=Bullet@12345" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: Decide hostname
+        run: |
+          if ([int]"${{ inputs.rdp_count }}" -gt 1) {
+            $env:TS_HOSTNAME = "bullet${{ matrix.id }}"
+          } else {
+            $env:TS_HOSTNAME = "bullet"
+          }
+          "TS_HOSTNAME=$env:TS_HOSTNAME" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-    - name: Setup Tailscale + RDP
-      shell: pwsh
-      run: |
-        $ErrorActionPreference="Stop"
-        Write-Host "Runtime (minutes): $env:RUNTIME"
-        Write-Host "Setting up Tailscale..."
-        iwr https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe -OutFile tailscale.exe
-        Start-Process tailscale.exe -ArgumentList "/install /quiet" -Wait
-        Start-Process "C:\Program Files\Tailscale\tailscale.exe" -ArgumentList "up --authkey ${{ github.event.inputs.ts_authkey }} --hostname $env:HOSTNAME --accept-dns=false" -Wait
-        Write-Host "Tailscale connected."
+      - name: Setup Tailscale + RDP
+        run: |
+          $ErrorActionPreference="Stop"
+          function Yes($v){ "$v" -match '^(?i:true|1|yes|on)$' }
+          function IntOr($v,$d){ if("$v" -match '^\d+$'){ [int]$v } else { [int]$d } }
 
-        Write-Host "Enabling RDP..."
-        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
-        Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-        net user $env:USER $env:PASS /add
-        net localgroup administrators $env:USER /add
-        Write-Host "RDP ready at hostname $env:HOSTNAME"
+          # --- runtime ---
+          $runtime = IntOr("${{ inputs.runtime_minutes }}", 355)
+          if (Yes("${{ inputs.quick_test }}")) { $runtime = 5 }
+          if (-not (Yes("${{ inputs.quick_test }}")) -and $runtime -lt 6) { $runtime = 355 }
+          if ($runtime -gt 360) { $runtime = 355 }
+          "RUNTIME_MINUTES=$runtime" | Out-File -Append $env:GITHUB_ENV
 
-    - name: Install RustDesk (winget + fallback)
-      shell: pwsh
-      run: |
-        $ErrorActionPreference="SilentlyContinue"
-        Write-Host "Trying winget install for RustDesk..."
-        winget install --id=RustDesk.RustDesk -e --silent --accept-source-agreements --accept-package-agreements
-        if (-not (Get-Command rustdesk -ErrorAction SilentlyContinue)) {
-          Write-Host "Winget failed, fallback to GitHub EXE..."
-          $url="https://github.com/rustdesk/rustdesk/releases/download/1.2.3/rustdesk-1.2.3-x86_64.exe"
-          $exe="$env:TEMP\rustdesk.exe"
-          Invoke-WebRequest $url -OutFile $exe -UseBasicParsing
-          Start-Process $exe -ArgumentList "/VERYSILENT /NORESTART" -Wait
-        }
-        Write-Host "RustDesk installed."
+          # --- purge bullet* devices (optional) ---
+          if (Yes("${{ inputs.do_purge }}")) {
+            try{
+              $auth=[Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("${{ inputs.ts_api_key }}:"))
+              $tn=[uri]::EscapeDataString("${{ inputs.ts_tailnet }}")
+              $resp=Invoke-RestMethod "https://api.tailscale.com/api/v2/tailnet/$tn/devices" -Headers @{Authorization="Basic $auth"}
+              foreach($d in $resp.devices){
+                if($d.hostname -match '^bullet[0-9]*$'){
+                  Invoke-RestMethod -Method Delete -Uri "https://api.tailscale.com/api/v2/device/$($d.id)" -Headers @{Authorization="Basic $auth"} -ErrorAction SilentlyContinue
+                }
+              }
+              Write-Host "Purged existing bullet* devices (if any)."
+            } catch { Write-Host "Purge warning: $($_.Exception.Message)" }
+          }
 
-    - name: Launch RustDesk
-      shell: pwsh
-      run: |
-        $rd = Get-ChildItem "C:\Program Files" -Recurse -Filter "rustdesk.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
-        if(-not $rd){ $rd = Get-ChildItem "C:\Program Files (x86)" -Recurse -Filter "rustdesk.exe" -ErrorAction SilentlyContinue | Select-Object -First 1 }
-        if($rd){
-          Write-Host "Launching RustDesk: $($rd.FullName)"
-          Start-Process $rd.FullName
-          Start-Sleep -Seconds 15
-        } else {
-          Write-Error "RustDesk not found after install"
-        }
+          # --- install & login tailscale ---
+          $ts="C:\Program Files\Tailscale\tailscale.exe"
+          if(-not(Test-Path $ts)){
+            $url="https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe"
+            $dst="$env:TEMP\ts-setup.exe"
+            Invoke-WebRequest $url -OutFile $dst -UseBasicParsing
+            Start-Process $dst -ArgumentList "/quiet" -Wait
+          }
+          Start-Service Tailscale -ErrorAction SilentlyContinue
+          & $ts logout | Out-Null
+          & $ts up --authkey "${{ inputs.ts_authkey }}" --hostname "$env:TS_HOSTNAME" --accept-routes --accept-dns=false
+          $ip=& $ts ip -4 | Select-Object -First 1
 
-    - name: Take full-screen screenshot (RustDesk visible)
-      shell: pwsh
-      run: |
-        Add-Type -AssemblyName System.Windows.Forms
-        Add-Type -AssemblyName System.Drawing
-        $bmp = New-Object Drawing.Bitmap([System.Windows.Forms.Screen]::PrimaryScreen.Bounds.Width,
-                                         [System.Windows.Forms.Screen]::PrimaryScreen.Bounds.Height)
-        $graphics = [Drawing.Graphics]::FromImage($bmp)
-        $graphics.CopyFromScreen([System.Drawing.Point]::Empty,[System.Drawing.Point]::Empty,$bmp.Size)
-        $file = "$env:GITHUB_WORKSPACE\rustdesk-screen.png"
-        $bmp.Save($file, [System.Drawing.Imaging.ImageFormat]::Png)
-        Write-Host "Saved screenshot to $file"
+          # --- enable rdp & user ---
+          $u=$env:RDP_USER; $p=$env:RDP_PASS
+          $sec=ConvertTo-SecureString $p -AsPlainText -Force
+          if(-not(Get-LocalUser -Name $u -EA SilentlyContinue)){
+            New-LocalUser -Name $u -Password $sec -AccountNeverExpires
+            Add-LocalGroupMember Administrators $u
+            Add-LocalGroupMember "Remote Desktop Users" $u
+          } else {
+            Set-LocalUser -Name $u -Password $sec -AccountNeverExpires
+            Enable-LocalUser -Name $u
+          }
+          Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" fDenyTSConnections 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
 
-    - name: Upload screenshot artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: rustdesk-screenshot
-        path: rustdesk-screen.png
+          Write-Host "RDP login → user=$u pass=$p ip=$ip dns=$env:TS_HOSTNAME"
 
-    - name: Keep alive
-      shell: pwsh
-      run: |
-        Write-Host "Keeping session alive for $env:RUNTIME minutes..."
-        Start-Sleep -Seconds ($env:RUNTIME * 60)
+      - name: Install RustDesk (winget + safe fallback)
+        run: |
+          $ErrorActionPreference="SilentlyContinue"
+          # Try winget first (most reliable on GH runners)
+          winget install --id RustDesk.RustDesk -e --silent --accept-package-agreements --accept-source-agreements --disable-interactivity
+          # Fallback to EXE if winget failed to install
+          $paths=@(
+            "C:\Program Files\RustDesk\rustdesk.exe",
+            "C:\Program Files (x86)\RustDesk\rustdesk.exe",
+            "$env:LOCALAPPDATA\Programs\RustDesk\rustdesk.exe"
+          )
+          $present = $paths | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if(-not $present){
+            Write-Host "Winget did not place RustDesk; trying direct EXE fallback..."
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            $url="https://github.com/rustdesk/rustdesk/releases/download/1.2.3/rustdesk-1.2.3-x86_64.exe"
+            $exe="$env:TEMP\rustdesk.exe"
+            try {
+              Invoke-WebRequest -Uri $url -OutFile $exe -UseBasicParsing
+              Start-Process $exe -ArgumentList "/verysilent /norestart" -Wait
+            } catch { Write-Host "RustDesk EXE fallback failed: $($_.Exception.Message)" }
+          }
+          Write-Host "RustDesk install step completed."
+
+      - name: Launch RustDesk (robust, non-blocking)
+        run: |
+          $ErrorActionPreference="SilentlyContinue"
+          $candidates=@(
+            "C:\Program Files\RustDesk\rustdesk.exe",
+            "C:\Program Files (x86)\RustDesk\rustdesk.exe",
+            "$env:LOCALAPPDATA\Programs\RustDesk\rustdesk.exe",
+            "$env:ProgramFiles\RustDesk\rustdesk.exe",
+            "$env:ProgramFiles(x86)\RustDesk\rustdesk.exe"
+          ) | Where-Object { $_ -and (Test-Path $_) }
+          $exe = $candidates | Select-Object -First 1
+          if(-not $exe){
+            # quick 2-depth search (fast; avoids the long blocking search)
+            try {
+              $hit = Get-ChildItem -Path "C:\Program Files","C:\Program Files (x86)" -Filter rustdesk.exe -File -Recurse -Depth 2 | Select-Object -First 1
+              if($hit){ $exe=$hit.FullName }
+            } catch {}
+          }
+          if($exe){
+            Write-Host "RustDesk path: $exe"
+            if(-not (Get-Process -Name rustdesk -ErrorAction SilentlyContinue)){
+              Start-Process -FilePath $exe -WindowStyle Normal
+              Start-Sleep -Seconds 8
+            } else {
+              Write-Host "RustDesk already running."
+            }
+          } else {
+            Write-Host "RustDesk not found on disk (continuing)."
+          }
+
+      - name: Close Tailscale UI and focus + maximize RustDesk
+        run: |
+          $ErrorActionPreference="SilentlyContinue"
+          # Close the popup UI without touching the service
+          Stop-Process -Name "TailscaleSystemUI" -Force -ErrorAction SilentlyContinue
+          Stop-Process -Name "Tailscale" -Force -ErrorAction SilentlyContinue
+
+          Start-Sleep -Seconds 3
+          # Focus & maximize RustDesk via COM
+          $rd = $null
+          for ($i=0; $i -lt 12; $i++) {
+            $rd = Get-Process -Name rustdesk -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($rd -and $rd.MainWindowHandle -ne 0) { break }
+            Start-Sleep -Seconds 1
+          }
+          try {
+            if ($rd) {
+              $ws = New-Object -ComObject WScript.Shell
+              $null = $ws.AppActivate($rd.Id)
+              Start-Sleep -Milliseconds 400
+              $ws.SendKeys('% ')
+              Start-Sleep -Milliseconds 150
+              $ws.SendKeys('x')
+              Start-Sleep -Seconds 2
+              Write-Host "RustDesk focused & maximized."
+            } else {
+              Write-Host "RustDesk window not found; continuing."
+            }
+          } catch { Write-Host "Focus warning: $($_.Exception.Message)" }
+
+      - name: Show RustDesk ID + Password in logs (if available)
+        run: |
+          $idFile  = Join-Path $env:ProgramData "rustdesk\id"
+          $pwdFile = Join-Path $env:ProgramData "rustdesk\password.txt"
+          $id  = (Test-Path $idFile)  ? (Get-Content $idFile  -Raw).Trim() : "unknown"
+          $pwd = (Test-Path $pwdFile) ? (Get-Content $pwdFile -Raw).Trim() : "***"
+          Write-Host "RustDesk → ID: $id  | Password: $pwd"
+
+      - name: Take full-screen screenshot (RustDesk visible)
+        run: |
+          Add-Type -AssemblyName System.Windows.Forms
+          Add-Type -AssemblyName System.Drawing
+          $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+          $bmp = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
+          $gfx = [System.Drawing.Graphics]::FromImage($bmp)
+          $gfx.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
+          $file = "$env:RUNNER_TEMP\rustdesk-login-${{ env.TS_HOSTNAME }}.png"
+          $bmp.Save($file, [System.Drawing.Imaging.ImageFormat]::Png)
+          $gfx.Dispose(); $bmp.Dispose()
+          Write-Host "Saved screenshot: $file"
+
+      - name: Upload screenshot artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustdesk-login-${{ env.TS_HOSTNAME }}
+          path: ${{ runner.temp }}/rustdesk-login-${{ env.TS_HOSTNAME }}.png
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Keep alive
+        run: |
+          $mins = [int]"${{ inputs.runtime_minutes }}"
+          if ("${{ inputs.quick_test }}" -match '^(?i:true|1|yes|on)$') { $mins = 5 } elseif ($mins -lt 6 -or $mins -gt 360) { $mins = 355 }
+          $end=(Get-Date).AddMinutes($mins)
+          while((Get-Date) -lt $end){ Start-Sleep -Seconds 60 }
+
+      - name: Dispatch next or stop
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $cycles = [int]"${{ inputs.cycles }}"
+          if ($cycles -gt 0) {
+            $next = $cycles - 1
+            if ($next -le 0) {
+              $url = "https://api.github.com/repos/${{ github.repository }}/actions/workflows/rdp-tailscale-stop.yml/dispatches"
+              $hdr = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = "application/vnd.github+json" }
+              $payload = @{ ts_tailnet = "${{ inputs.ts_tailnet }}"; ts_api_key = "${{ inputs.ts_api_key }}"; base_prefix = "bullet"; max_count = "10"; dry_run = "false" }
+              $body = @{ ref = "${{ github.ref_name }}"; inputs = $payload } | ConvertTo-Json -Depth 20
+              Invoke-WebRequest -Method POST -Uri $url -Headers $hdr -Body $body | Out-Null
+              Write-Host "Dispatched STOP."
+            } else {
+              $payload = @{
+                ts_tailnet      = "${{ inputs.ts_tailnet }}"
+                ts_api_key      = "${{ inputs.ts_api_key }}"
+                ts_authkey      = "${{ inputs.ts_authkey }}"
+                quick_test      = "${{ inputs.quick_test }}"
+                runtime_minutes = "${{ inputs.runtime_minutes }}"
+                do_purge        = "${{ inputs.do_purge }}"
+                cycles          = "$next"
+                rdp_count       = "${{ inputs.rdp_count }}"
+              }
+              $url2  = "https://api.github.com/repos/${{ github.repository }}/actions/workflows/rdp-tailscale-B.yml/dispatches"
+              $hdr2  = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = "application/vnd.github+json" }
+              $body2 = @{ ref = "${{ github.ref_name }}"; inputs = $payload } | ConvertTo-Json -Depth 20
+              Invoke-WebRequest -Method POST -Uri $url2 -Headers $hdr2 -Body $body2 | Out-Null
+              Write-Host "Dispatched Workflow B with cycles=$next"
+            }
+          } else {
+            Write-Host "No cycles configured. Done."
+          }
