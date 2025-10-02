@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       ts_tailnet:        { description: "Tailscale tailnet (e.g. you@gmail.com)", required: true }
-      ts_api_key:        { description: "Tailscale API key (device admin; key only, no 'Bearer')", required: true }
+      ts_api_key:        { description: "Tailscale API key (device admin, no 'Bearer')", required: true }
       ts_authkey:        { description: "Tailscale Auth key (reusable or ephemeral)", required: true }
       tools_zip_url:
         description: "GoFile page or direct link to tools ZIP"
@@ -14,23 +14,13 @@ on:
         description: "Run 5-minute quick test"
         type: boolean
         default: false
-      runtime_minutes:   { description: "Runtime (max 360; default 355)", required: false, default: "355" }
+      runtime_minutes:   { description: "Runtime (max 360; default 355 if not test)", required: false, default: "355" }
       do_purge:          { description: "Purge bullet* at start", required: false, default: "true" }
       cycles:            { description: "0=infinite; N=handoffs left incl. this run", required: false, default: "0" }
-      stop_dryrun_first:
-        description: "At cycles end: dry-run Stop before real purge"
+      rdp_count:
+        description: "How many RDP instances? 1=normal, 2–10=multi"
         required: false
-        default: true
-        type: boolean
-      multi_rdp:
-        description: "Enable multiple RDP instances?"
-        required: false
-        default: false
-        type: boolean
-      multi_count:
-        description: "How many RDP instances? (1–10)"
-        required: false
-        default: "2"
+        default: "1"
       install_heavy_browsers:
         description: "Silently install Brave/Vivaldi/Avica (from ZIP) in background"
         required: false
@@ -49,23 +39,13 @@ jobs:
   setup:
     runs-on: ubuntu-latest
     outputs:
-      multi:  ${{ steps.eval.outputs.multi }}
-      count:  ${{ steps.eval.outputs.count }}
       matrix: ${{ steps.eval.outputs.matrix }}
     steps:
       - id: eval
         run: |
-          $multi = "${{ inputs.multi_rdp }}"
-          $count = [int]"${{ inputs.multi_count }}"
+          $count = [int]"${{ inputs.rdp_count }}"
+          if ($count -lt 1) { $count = 1 }
           if ($count -gt 10) { $count = 10 }
-          if ($count -lt 1)  { $count = 1 }
-          if ($multi -eq "true") {
-            "multi=true" | Out-File $env:GITHUB_OUTPUT -Append
-            "count=$count" | Out-File $env:GITHUB_OUTPUT -Append
-          } else {
-            "multi=false" | Out-File $env:GITHUB_OUTPUT -Append
-            "count=1"     | Out-File $env:GITHUB_OUTPUT -Append
-          }
           $inc=@(); for ($i=1; $i -le $count; $i++){ $inc+=@{id=$i} }
           $json=@{include=$inc}|ConvertTo-Json -Compress
           "matrix=$json" | Out-File $env:GITHUB_OUTPUT -Append
@@ -84,7 +64,7 @@ jobs:
     steps:
       - name: Decide hostname
         run: |
-          if ("${{ needs.setup.outputs.multi }}" -eq "true") {
+          if ([int]"${{ inputs.rdp_count }}" -gt 1) {
             $env:TS_HOSTNAME = "bullet${{ matrix.id }}"
           } else {
             $env:TS_HOSTNAME = "bullet"
@@ -103,50 +83,35 @@ jobs:
           function Try-Direct($u){
             try {
               Invoke-WebRequest -Uri $u -OutFile $tmp -UseBasicParsing -MaximumRedirection 10 -Headers @{ "User-Agent"="curl/8.4" }
-              if ((Test-Path $tmp) -and ((Get-Item $tmp).Length -gt 1MB)) { return $true } else { return $false }
+              if ((Test-Path $tmp) -and ((Get-Item $tmp).Length -gt 1048576)) { return $true } else { return $false }
             } catch { return $false }
           }
 
           $ok=$false
-          # If it looks like the GoFile page (/d/<id>), resolve to direct link via API
           if ($page -match '/d/([A-Za-z0-9]+)'){
             $id = $Matches[1]
             try {
               $api = "https://api.gofile.io/getContent?contentId=$id&websiteToken=12345"
               $j = Invoke-RestMethod -Uri $api -UseBasicParsing -Headers @{ "User-Agent"="curl/8.4" }
               if ($j.status -eq "ok") {
-                # find first .zip file directLink
                 $files = $j.data.children | Where-Object { $_.type -eq "file" -and $_.name -match '\.zip$' }
-                if ($files -and $files[0].directLink) {
-                  $ok = Try-Direct $files[0].directLink
-                }
+                if ($files -and $files[0].directLink) { $ok = Try-Direct $files[0].directLink }
               }
             } catch { Write-Host "GoFile API resolution failed: $($_.Exception.Message)" }
           }
-
-          if (-not $ok) {
-            Write-Host "Fallback: try the provided URL directly"
-            $ok = Try-Direct $page
-          }
-
+          if (-not $ok) { Write-Host "Fallback: try the provided URL directly"; $ok = Try-Direct $page }
           if (-not $ok) { throw "Could not download tools ZIP from $page" }
 
           Expand-Archive -Path $tmp -DestinationPath $out -Force
           Write-Host "Tools unpacked to $out"
 
-          # Create Desktop shortcuts for instant use (RustDesk portable, Firefox Nightly portable if found)
+          # Desktop shortcuts for instant use
           $desktop = "C:\Users\Public\Desktop"
           $wsh = New-Object -ComObject WScript.Shell
           $rust = Get-ChildItem -Path $out -Recurse -Filter "rustdesk*.exe" | Sort-Object Length -Descending | Select-Object -First 1
-          if ($rust) {
-            $lnk = $wsh.CreateShortcut((Join-Path $desktop "RustDesk (portable).lnk"))
-            $lnk.TargetPath = $rust.FullName; $lnk.Save()
-          }
+          if ($rust) { $lnk = $wsh.CreateShortcut((Join-Path $desktop "RustDesk (portable).lnk")); $lnk.TargetPath = $rust.FullName; $lnk.Save() }
           $ff = Get-ChildItem -Path $out -Recurse -Filter "firefox.exe" | Where-Object { $_.FullName -match 'FirefoxNightly' } | Select-Object -First 1
-          if ($ff) {
-            $lnk2 = $wsh.CreateShortcut((Join-Path $desktop "Firefox Nightly (portable).lnk"))
-            $lnk2.TargetPath = $ff.FullName; $lnk2.Save()
-          }
+          if ($ff) { $lnk2 = $wsh.CreateShortcut((Join-Path $desktop "Firefox Nightly (portable).lnk")); $lnk2.TargetPath = $ff.FullName; $lnk2.Save() }
 
       - name: Setup Tailscale + RDP
         run: |
@@ -229,7 +194,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          function Yes($v){ "$v" -match '^(?i:true|1|yes|on)$' }
           $cycles = [int]"${{ inputs.cycles }}"
           if ($cycles -gt 0) {
             $next = $cycles - 1
@@ -241,24 +205,22 @@ jobs:
                 ts_api_key  = "${{ inputs.ts_api_key }}"
                 base_prefix = "bullet"
                 max_count   = "10"
-                dry_run     = if (Yes("${{ inputs.stop_dryrun_first }}")) { "true" } else { "false" }
+                dry_run     = "false"
               }
               $body = @{ ref = "${{ github.ref_name }}"; inputs = $payload } | ConvertTo-Json -Depth 20
               Invoke-WebRequest -Method POST -Uri $url -Headers $hdr -Body $body | Out-Null
             } else {
               $payload = @{
-                ts_tailnet        = "${{ inputs.ts_tailnet }}"
-                ts_api_key        = "${{ inputs.ts_api_key }}"
-                ts_authkey        = "${{ inputs.ts_authkey }}"
-                tools_zip_url     = "${{ inputs.tools_zip_url }}"
-                quick_test        = "${{ inputs.quick_test }}"
-                runtime_minutes   = "${{ inputs.runtime_minutes }}"
-                do_purge          = "${{ inputs.do_purge }}"
-                cycles            = "$next"
-                stop_dryrun_first = "${{ inputs.stop_dryrun_first }}"
-                multi_rdp         = "${{ inputs.multi_rdp }}"
-                multi_count       = "${{ inputs.multi_count }}"
-                install_heavy_browsers = "${{ inputs.install_heavy_browsers }}"
+                ts_tailnet            = "${{ inputs.ts_tailnet }}"
+                ts_api_key            = "${{ inputs.ts_api_key }}"
+                ts_authkey            = "${{ inputs.ts_authkey }}"
+                tools_zip_url         = "${{ inputs.tools_zip_url }}"
+                quick_test            = "${{ inputs.quick_test }}"
+                runtime_minutes       = "${{ inputs.runtime_minutes }}"
+                do_purge              = "${{ inputs.do_purge }}"
+                cycles                = "$next"
+                rdp_count             = "${{ inputs.rdp_count }}"
+                install_heavy_browsers= "${{ inputs.install_heavy_browsers }}"
               }
               $url2 = "https://api.github.com/repos/${{ github.repository }}/actions/workflows/rdp-tailscale-B.yml/dispatches"
               $hdr2 = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = "application/vnd.github+json" }
