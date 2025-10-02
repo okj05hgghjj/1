@@ -1,35 +1,35 @@
-name: "RDP via Tailscale + RustDesk (Workflow A)"
+name: RDP via Tailscale + RustDesk (Workflow A)
 
 on:
   workflow_dispatch:
     inputs:
       ts_tailnet:
-        description: "Tailscale tailnet (e.g. you@gmail.com)"
+        description: Tailscale tailnet (e.g. you@gmail.com)
         required: true
       ts_api_key:
-        description: "Tailscale API key (device admin, no 'Bearer')"
+        description: Tailscale API key (device admin, no 'Bearer')
         required: true
       ts_authkey:
-        description: "Tailscale Auth key (reusable or ephemeral)"
+        description: Tailscale Auth key (reusable or ephemeral)
         required: true
       quick_test:
-        description: "Run 5-minute quick test"
+        description: Run 5-minute quick test
         type: boolean
         default: false
       runtime_minutes:
-        description: "Runtime (max 360; default 355 if not test)"
+        description: Runtime (max 360; default 355 if not test)
         required: false
         default: "355"
       do_purge:
-        description: "Purge bullet* devices at start"
+        description: Purge bullet* devices at start
         required: false
         default: "true"
       cycles:
-        description: "0 = stop after A; N = handoffs left incl. this run"
+        description: 0 = stop after A; N = handoffs left incl. this run
         required: false
         default: "0"
       rdp_count:
-        description: "How many RDP instances? 1=normal, 2–10=multi"
+        description: How many RDP instances? 1=normal, 2-10=multi
         required: false
         default: "1"
 
@@ -52,8 +52,9 @@ jobs:
           $count = [int]"${{ inputs.rdp_count }}"
           if ($count -lt 1) { $count = 1 }
           if ($count -gt 10) { $count = 10 }
-          $inc=@(); for ($i=1; $i -le $count; $i++){ $inc+=@{id=$i} }
-          $json=@{include=$inc}|ConvertTo-Json -Compress
+          $include = @()
+          for ($i=1; $i -le $count; $i++) { $include += @{ id = $i } }
+          $json = @{ include = $include } | ConvertTo-Json -Compress
           "matrix=$json" | Out-File $env:GITHUB_OUTPUT -Append
 
   rdp:
@@ -64,8 +65,8 @@ jobs:
       max-parallel: 10
     timeout-minutes: 370
     env:
-      RDP_USER:    Bullettemporary
-      RDP_PASS:    Bullet@12345
+      RDP_USER: Bullettemporary
+      RDP_PASS: Bullet@12345
 
     steps:
       - name: Setup hostname
@@ -78,51 +79,52 @@ jobs:
           "TS_HOSTNAME=$env:TS_HOSTNAME" | Out-File -FilePath $env:GITHUB_ENV -Append
           Write-Host "Hostname: $env:TS_HOSTNAME"
 
-      - name: Setup Tailscale + RDP
+      - name: Setup Tailscale and RDP
         run: |
-          $ErrorActionPreference="Stop"
+          $ErrorActionPreference = "Stop"
+
           function Yes($v){ "$v" -match '^(?i:true|1|yes|on)$' }
           function IntOr($v,$d){ if("$v" -match '^\d+$'){ [int]$v } else { [int]$d } }
 
-          # --- runtime ---
+          # Runtime
           $runtime = IntOr("${{ inputs.runtime_minutes }}", 355)
           if (Yes("${{ inputs.quick_test }}")) { $runtime = 5 }
           if (-not (Yes("${{ inputs.quick_test }}")) -and $runtime -lt 6) { $runtime = 355 }
           if ($runtime -gt 360) { $runtime = 355 }
           "RUNTIME_MINUTES=$runtime" | Out-File -Append $env:GITHUB_ENV
 
-          # --- optional purge bullet* via API ---
+          # Optional purge bullet* devices
           if (Yes("${{ inputs.do_purge }}")) {
-            try{
-              $auth=[Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("${{ inputs.ts_api_key }}:"))
-              $tn=[uri]::EscapeDataString("${{ inputs.ts_tailnet }}")
-              $resp=Invoke-RestMethod "https://api.tailscale.com/api/v2/tailnet/$tn/devices" -Headers @{Authorization="Basic $auth"}
-              foreach($d in $resp.devices){
-                if($d.hostname -match '^bullet[0-9]*$'){
-                  Invoke-RestMethod -Method Delete -Uri "https://api.tailscale.com/api/v2/device/$($d.id)" -Headers @{Authorization="Basic $auth"} -ErrorAction SilentlyContinue
+            try {
+              $auth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("${{ inputs.ts_api_key }}:"))
+              $tn = [uri]::EscapeDataString("${{ inputs.ts_tailnet }}")
+              $resp = Invoke-RestMethod "https://api.tailscale.com/api/v2/tailnet/$tn/devices" -Headers @{ Authorization = "Basic $auth" }
+              foreach ($d in $resp.devices) {
+                if ($d.hostname -match '^bullet[0-9]*$') {
+                  Invoke-RestMethod -Method Delete -Uri "https://api.tailscale.com/api/v2/device/$($d.id)" -Headers @{ Authorization = "Basic $auth" } -ErrorAction SilentlyContinue
                 }
               }
               Write-Host "Purged existing bullet* devices (if any)."
             } catch { Write-Host "Purge warning: $($_.Exception.Message)" }
           }
 
-          # --- install & up tailscale ---
-          $ts="C:\Program Files\Tailscale\tailscale.exe"
-          if(-not(Test-Path $ts)){
-            $url="https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe"
-            $dst="$env:TEMP\ts-setup.exe"
+          # Tailscale install and up
+          $ts = "C:\Program Files\Tailscale\tailscale.exe"
+          if (-not (Test-Path $ts)) {
+            $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe"
+            $dst = "$env:TEMP\ts-setup.exe"
             Invoke-WebRequest $url -OutFile $dst -UseBasicParsing
             Start-Process $dst -ArgumentList "/quiet" -Wait
           }
           Start-Service Tailscale -ErrorAction SilentlyContinue
           & $ts logout | Out-Null
           & $ts up --authkey "${{ inputs.ts_authkey }}" --hostname "$env:TS_HOSTNAME" --accept-routes --accept-dns=false
-          $ip=& $ts ip -4 | Select-Object -First 1
+          $ip = & $ts ip -4 | Select-Object -First 1
 
-          # --- enable RDP & user ---
-          $u=$env:RDP_USER; $p=$env:RDP_PASS
-          $sec=ConvertTo-SecureString $p -AsPlainText -Force
-          if(-not(Get-LocalUser -Name $u -EA SilentlyContinue)){
+          # RDP enable and user
+          $u = $env:RDP_USER; $p = $env:RDP_PASS
+          $sec = ConvertTo-SecureString $p -AsPlainText -Force
+          if (-not (Get-LocalUser -Name $u -EA SilentlyContinue)) {
             New-LocalUser -Name $u -Password $sec -AccountNeverExpires
             Add-LocalGroupMember Administrators $u
             Add-LocalGroupMember "Remote Desktop Users" $u
@@ -133,23 +135,23 @@ jobs:
           Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" fDenyTSConnections 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
 
-          Write-Host "RDP login → user=$u pass=$p ip=$ip dns=$env:TS_HOSTNAME"
+          Write-Host "RDP login -> user=$u pass=$p ip=$ip dns=$env:TS_HOSTNAME"
 
       - name: Install RustDesk (winget + fallback)
         run: |
-          $ErrorActionPreference="SilentlyContinue"
+          $ErrorActionPreference = "SilentlyContinue"
           winget install --id RustDesk.RustDesk -e --silent --accept-package-agreements --accept-source-agreements --disable-interactivity
-          $paths=@(
+          $paths = @(
             "C:\Program Files\RustDesk\rustdesk.exe",
             "C:\Program Files (x86)\RustDesk\rustdesk.exe",
             "$env:LOCALAPPDATA\Programs\RustDesk\rustdesk.exe"
           )
           $present = $paths | Where-Object { Test-Path $_ } | Select-Object -First 1
-          if(-not $present){
-            Write-Host "Winget didn’t place RustDesk; trying EXE fallback…"
+          if (-not $present) {
+            Write-Host "Winget did not install RustDesk; trying EXE fallback..."
             [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-            $url="https://github.com/rustdesk/rustdesk/releases/download/1.2.3/rustdesk-1.2.3-x86_64.exe"
-            $exe="$env:TEMP\rustdesk.exe"
+            $url = "https://github.com/rustdesk/rustdesk/releases/download/1.2.3/rustdesk-1.2.3-x86_64.exe"
+            $exe = "$env:TEMP\rustdesk.exe"
             try {
               Invoke-WebRequest -Uri $url -OutFile $exe -UseBasicParsing
               Start-Process $exe -ArgumentList "/verysilent /norestart" -Wait
@@ -159,21 +161,21 @@ jobs:
 
       - name: Launch RustDesk
         run: |
-          $ErrorActionPreference="SilentlyContinue"
-          $candidates=@(
+          $ErrorActionPreference = "SilentlyContinue"
+          $candidates = @(
             "C:\Program Files\RustDesk\rustdesk.exe",
             "C:\Program Files (x86)\RustDesk\rustdesk.exe",
             "$env:LOCALAPPDATA\Programs\RustDesk\rustdesk.exe"
           ) | Where-Object { Test-Path $_ }
           $exe = $candidates | Select-Object -First 1
-          if(-not $exe){
+          if (-not $exe) {
             try {
               $hit = Get-ChildItem -Path "C:\Program Files","C:\Program Files (x86)" -Filter rustdesk.exe -File -Recurse -Depth 2 | Select-Object -First 1
-              if($hit){ $exe=$hit.FullName }
+              if ($hit) { $exe = $hit.FullName }
             } catch {}
           }
-          if($exe){
-            if(-not (Get-Process -Name rustdesk -EA SilentlyContinue)){
+          if ($exe) {
+            if (-not (Get-Process -Name rustdesk -EA SilentlyContinue)) {
               Start-Process -FilePath $exe -WindowStyle Normal
               Start-Sleep -Seconds 8
             }
@@ -182,24 +184,22 @@ jobs:
             Write-Host "RustDesk not found (continuing)."
           }
 
-      - name: Close Tailscale popup + focus & maximize RustDesk
+      - name: Close Tailscale popup, focus and maximize RustDesk
         run: |
-          $ErrorActionPreference="SilentlyContinue"
+          $ErrorActionPreference = "SilentlyContinue"
 
-          # user32 helpers
-          Add-Type @"
+          Add-Type @'
           using System;
           using System.Runtime.InteropServices;
           public class Win32 {
             [DllImport("user32.dll")]
             public static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
             [DllImport("user32.dll")]
-            [return: MarshalAs(UnmanagedType.Bool)]
             public static extern bool PostMessage(IntPtr hWnd, uint Msg, int wParam, int lParam);
           }
-"@
+'@
 
-          # Close visible Tailscale popup window if present
+          # Close Tailscale popup window if present
           $hwnd = [Win32]::FindWindow([NullString]::Value, "Tailscale")
           if ($hwnd -ne [IntPtr]::Zero) {
             [Win32]::PostMessage($hwnd, 0x0010, 0, 0) | Out-Null  # WM_CLOSE
@@ -225,19 +225,19 @@ jobs:
               Start-Sleep -Milliseconds 150
               $ws.SendKeys('x')
               Start-Sleep -Seconds 2
-              Write-Host "RustDesk focused & maximized."
+              Write-Host "RustDesk focused and maximized."
             } else {
               Write-Host "RustDesk window not found; continuing."
             }
           } catch { Write-Host "Focus warning: $($_.Exception.Message)" }
 
-      - name: Show RustDesk ID + Password in logs (if available)
+      - name: Show RustDesk ID and Password in logs if available
         run: |
           $idFile  = Join-Path $env:ProgramData "rustdesk\id"
           $pwdFile = Join-Path $env:ProgramData "rustdesk\password.txt"
           $id  = (Test-Path $idFile)  ? (Get-Content $idFile  -Raw).Trim() : "unknown"
           $pwd = (Test-Path $pwdFile) ? (Get-Content $pwdFile -Raw).Trim() : "***"
-          Write-Host "RustDesk → ID: $id  | Password: $pwd"
+          Write-Host "RustDesk -> ID: $id | Password: $pwd"
 
       - name: Take full-screen screenshot (RustDesk visible)
         run: |
@@ -247,7 +247,7 @@ jobs:
           $bmp = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
           $gfx = [System.Drawing.Graphics]::FromImage($bmp)
           $gfx.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
-          $file = "$env:RUNNER_TEMP\rustdesk-login-${{ env.TS_HOSTNAME }}.png"
+          $file = "$env:RUNNER_TEMP\rustdesk-login-$env:TS_HOSTNAME.png"
           $bmp.Save($file, [System.Drawing.Imaging.ImageFormat]::Png)
           $gfx.Dispose(); $bmp.Dispose()
           Write-Host "Saved screenshot: $file"
@@ -265,17 +265,16 @@ jobs:
           $mins = [int]"${{ env.RUNTIME_MINUTES }}"
           $end = (Get-Date).AddMinutes($mins)
 
-          Add-Type @"
+          Add-Type @'
           using System;
           using System.Runtime.InteropServices;
           public class Win32 {
             [DllImport("user32.dll")]
             public static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
             [DllImport("user32.dll")]
-            [return: MarshalAs(UnmanagedType.Bool)]
             public static extern bool PostMessage(IntPtr hWnd, uint Msg, int wParam, int lParam);
           }
-"@
+'@
 
           while ((Get-Date) -lt $end) {
             try {
