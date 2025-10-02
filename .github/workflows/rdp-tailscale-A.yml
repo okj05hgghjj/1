@@ -38,25 +38,38 @@ jobs:
     steps:
       - name: Decide hostname
         run: |
-          if ("${{ inputs.multi_rdp }}" -eq "true") {
-            $env:TS_HOSTNAME = "bullet1"
-          } else {
-            $env:TS_HOSTNAME = "bullet"
-          }
+          if ("${{ inputs.multi_rdp }}" -eq "true") { $env:TS_HOSTNAME = "bullet1" } else { $env:TS_HOSTNAME = "bullet" }
           "TS_HOSTNAME=$env:TS_HOSTNAME" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Setup Tailscale + RDP
         run: |
           $ErrorActionPreference = "Stop"
+          function Yes($v){ "$v" -match '^(?i:true|1|yes|on)$' }
 
-          # Runtime
+          # Runtime selection
           $runtime = [int]"${{ inputs.runtime_minutes }}"
-          if ("${{ inputs.quick_test }}" -eq "true") { $runtime = 5 }
+          if (Yes("${{ inputs.quick_test }}")) { $runtime = 5 }
           if ($runtime -gt 360) { $runtime = 355 }
+          if ($runtime -lt 6 -and -not (Yes("${{ inputs.quick_test }}"))) { $runtime = 355 }
           "RUNTIME_MINUTES=$runtime" | Out-File -FilePath $env:GITHUB_ENV -Append
           Write-Host "Runtime: $runtime minutes"
 
-          # Install Tailscale
+          # Optional purge of bullet*
+          if (Yes("${{ inputs.do_purge }}")) {
+            try {
+              $auth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("${{ inputs.ts_api_key }}:"))
+              $tn   = [System.Uri]::EscapeDataString("${{ inputs.ts_tailnet }}")
+              $resp = Invoke-RestMethod -Uri "https://api.tailscale.com/api/v2/tailnet/$tn/devices" -Headers @{ Authorization = "Basic $auth" }
+              foreach ($d in $resp.devices) {
+                if ($d.hostname -match '^bullet[0-9]*$') {
+                  Invoke-RestMethod -Method Delete -Uri "https://api.tailscale.com/api/v2/device/$($d.id)" -Headers @{ Authorization = "Basic $auth" } -ErrorAction SilentlyContinue
+                }
+              }
+              Write-Host "Purged existing bullet* devices (if any)."
+            } catch { Write-Host "Purge warning: $($_.Exception.Message)" }
+          }
+
+          # Tailscale
           $tsExe = "C:\Program Files\Tailscale\tailscale.exe"
           if (-not (Test-Path $tsExe)) {
             $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe"
@@ -65,6 +78,7 @@ jobs:
             Start-Process -FilePath $dst -ArgumentList "/quiet" -Wait
           }
           Start-Service Tailscale -ErrorAction SilentlyContinue
+          & $tsExe logout | Out-Null
           & $tsExe up --authkey "${{ inputs.ts_authkey }}" --hostname $env:TS_HOSTNAME --accept-routes --accept-dns=false
 
           # Enable RDP account
@@ -74,33 +88,84 @@ jobs:
             New-LocalUser -Name $user -Password $sec -AccountNeverExpires
             Add-LocalGroupMember -Group Administrators -Member $user
             Add-LocalGroupMember -Group "Remote Desktop Users" -Member $user
+          } else {
+            Set-LocalUser -Name $user -Password $sec -AccountNeverExpires
+            Enable-LocalUser -Name $user
           }
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
           Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
 
           $ip4 = (& $tsExe ip -4 | Select-Object -First 1)
           Write-Host "RDP login → user=$user pass=$pass ip=$ip4"
 
-      - name: Install RustDesk + Get ID
+      - name: Install RustDesk (robust) + Get ID
         run: |
-          $msiUrl = "https://github.com/rustdesk/rustdesk/releases/download/1.2.3/rustdesk-1.2.3-x86_64.msi"
-          $msi = "$env:TEMP\rustdesk.msi"
-          Invoke-WebRequest -Uri $msiUrl -OutFile $msi -UseBasicParsing
-          Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn" -Wait
+          $ErrorActionPreference = "Stop"
+          # Helpers
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          $Headers = @{ "User-Agent" = "curl/8.4"; "Accept" = "*/*" }
 
-          $exe = "C:\Program Files\RustDesk\rustdesk.exe"
-          if (-not (Test-Path $exe)) { $exe = "C:\Program Files (x86)\RustDesk\rustdesk.exe" }
-          if (-not (Test-Path $exe)) { throw "RustDesk not found" }
+          function Test-MsiFile($path){
+            if (-not (Test-Path $path)) { return $false }
+            $fi = Get-Item $path
+            if ($fi.Length -lt 5MB) { return $false }               # too small → likely HTML
+            $fs = [System.IO.File]::OpenRead($path)
+            try {
+              $buf = New-Object byte[] 8
+              $null = $fs.Read($buf,0,8)
+              # MSI (OLE Compound) magic bytes: D0 CF 11 E0 A1 B1 1A E1
+              $hex = ($buf | ForEach-Object { $_.ToString("X2") }) -join " "
+              return ($hex -eq "D0 CF 11 E0 A1 B1 1A E1")
+            } finally { $fs.Dispose() }
+          }
 
+          # 1) Try winget first
+          $rustExe = $null
+          try {
+            $winget = "$env:LOCALAPPDATA\Microsoft\WindowsApps\winget.exe"; if (-not (Test-Path $winget)) { $winget = "winget" }
+            & $winget install --id RustDesk.RustDesk -e --silent --accept-package-agreements --accept-source-agreements
+          } catch {}
+
+          if (Test-Path "C:\Program Files\RustDesk\rustdesk.exe") { $rustExe = "C:\Program Files\RustDesk\rustdesk.exe" }
+          elseif (Test-Path "C:\Program Files (x86)\RustDesk\rustdesk.exe") { $rustExe = "C:\Program Files (x86)\RustDesk\rustdesk.exe" }
+
+          # 2) If winget failed, fetch MSI from GitHub (pinned version) with headers + verify
+          if (-not $rustExe) {
+            $msi = "$env:TEMP\rustdesk.msi"
+            $ghUrl = "https://github.com/rustdesk/rustdesk/releases/download/1.2.3/rustdesk-1.2.3-x86_64.msi"
+            try {
+              Invoke-WebRequest -Uri $ghUrl -Headers $Headers -MaximumRedirection 10 -OutFile $msi -UseBasicParsing
+            } catch { Write-Host "GitHub MSI download error: $($_.Exception.Message)" }
+            if (-not (Test-MsiFile $msi)) {
+              # 3) Fallback mirror (SourceForge) with headers + verify
+              $sfUrl = "https://sourceforge.net/projects/rustdesk/files/windows/rustdesk-1.2.3-x86_64.msi/download"
+              try {
+                Invoke-WebRequest -Uri $sfUrl -Headers $Headers -MaximumRedirection 10 -OutFile $msi -UseBasicParsing
+              } catch { Write-Host "SourceForge MSI download error: $($_.Exception.Message)" }
+            }
+            if (-not (Test-MsiFile $msi)) { throw "Could not obtain a valid RustDesk MSI (avoided HTML download)." }
+            Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn" -Wait
+            if (Test-Path "C:\Program Files\RustDesk\rustdesk.exe") { $rustExe = "C:\Program Files\RustDesk\rustdesk.exe" }
+            elseif (Test-Path "C:\Program Files (x86)\RustDesk\rustdesk.exe") { $rustExe = "C:\Program Files (x86)\RustDesk\rustdesk.exe" }
+            else { throw "RustDesk not found after MSI install." }
+          }
+
+          # Launch + password + ID
           $pwd = (New-Guid).Guid.Substring(0,8)
-          try { & $exe --password $pwd } catch {}
-          Start-Sleep -Seconds 10
+          Start-Process -FilePath $rustExe
+          Start-Sleep -Seconds 12
+          try { & $rustExe --password $pwd } catch {}
 
           $id = ""
-          if (Test-Path "C:\ProgramData\RustDesk\id") {
-            $id = Get-Content "C:\ProgramData\RustDesk\id" | Select-Object -First 1
+          for ($i=0; $i -lt 30 -and -not $id; $i++) {
+            try { $out = & $rustExe --get-id 2>$null; if ($out) { $id = $out.Trim() } } catch {}
+            if (-not $id -and (Test-Path "C:\ProgramData\RustDesk\id")) {
+              $maybe = Get-Content "C:\ProgramData\RustDesk\id" -ErrorAction SilentlyContinue | Select-Object -First 1
+              if ($maybe -match '^[0-9A-Za-z]{5,}$') { $id = $maybe.Trim() }
+            }
+            if (-not $id) { Start-Sleep -Seconds 3 }
           }
-          if (-not $id) { $id="unknown" }
+          if (-not $id) { $id = "unknown" }
 
           "RUSTDESK_ID=$id"   | Out-File -FilePath $env:GITHUB_ENV -Append
           "RUSTDESK_PWD=$pwd" | Out-File -FilePath $env:GITHUB_ENV -Append
