@@ -1,17 +1,32 @@
-name: "RDP via Tailscale + RustDesk (Workflow A)"
+name: "RDP via Tailscale + RustDesk + Avica + Browsers (Workflow A)"
 
 on:
   workflow_dispatch:
     inputs:
       ts_tailnet:        { description: "Tailscale tailnet (e.g. you@gmail.com)", required: true }
-      ts_api_key:        { description: "Tailscale API key (device admin, no 'Bearer')", required: true }
+      ts_api_key:        { description: "Tailscale API key (device admin)", required: true }
       ts_authkey:        { description: "Tailscale Auth key (reusable or ephemeral)", required: true }
       quick_test:
         description: "Run 5-minute quick test"
         type: boolean
         default: false
-      runtime_minutes:   { description: "Runtime (max 360; default 355; ignored if quick_test=true)", required: false, default: "355" }
+      runtime_minutes:   { description: "Runtime (max 360; default 355)", required: false, default: "355" }
       do_purge:          { description: "Purge bullet* at start", required: false, default: "true" }
+      cycles:            { description: "0=infinite; N=handoffs left incl. this run", required: false, default: "0" }
+      stop_dryrun_first:
+        description: "At cycles end: dry-run Stop before real purge"
+        required: false
+        default: true
+        type: boolean
+      multi_rdp:
+        description: "Enable multiple RDP instances?"
+        required: false
+        default: false
+        type: boolean
+      multi_count:
+        description: "How many RDP instances? (1–10)"
+        required: false
+        default: "2"
 
 permissions:
   contents: read
@@ -22,120 +37,133 @@ defaults:
     shell: pwsh
 
 jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      multi:  ${{ steps.eval.outputs.multi }}
+      count:  ${{ steps.eval.outputs.count }}
+      matrix: ${{ steps.eval.outputs.matrix }}
+    steps:
+      - id: eval
+        run: |
+          $multi = "${{ inputs.multi_rdp }}"
+          $count = [int]"${{ inputs.multi_count }}"
+          if ($count -gt 10) { $count = 10 }
+          if ($count -lt 1)  { $count = 1 }
+          if ($multi -eq "true") {
+            "multi=true" | Out-File $env:GITHUB_OUTPUT -Append
+            "count=$count" | Out-File $env:GITHUB_OUTPUT -Append
+          } else {
+            "multi=false" | Out-File $env:GITHUB_OUTPUT -Append
+            "count=1"     | Out-File $env:GITHUB_OUTPUT -Append
+          }
+          $inc=@(); for ($i=1; $i -le $count; $i++){ $inc+=@{id=$i} }
+          $json=@{include=$inc}|ConvertTo-Json -Compress
+          "matrix=$json" | Out-File $env:GITHUB_OUTPUT -Append
+
   rdp:
+    needs: setup
     runs-on: windows-2025
+    strategy:
+      matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
+      max-parallel: 10
     timeout-minutes: 370
+    env:
+      RDP_USER: Bullettemporary
+      RDP_PASS: Bullet@12345
 
     steps:
+      - name: Hostname
+        run: |
+          if ("${{ needs.setup.outputs.multi }}" -eq "true") {
+            $env:TS_HOSTNAME="bullet${{ matrix.id }}"
+          } else {
+            $env:TS_HOSTNAME="bullet"
+          }
+          "TS_HOSTNAME=$env:TS_HOSTNAME" | Out-File -FilePath $env:GITHUB_ENV -Append
+
       - name: Setup Tailscale + RDP
         run: |
-          $ErrorActionPreference = "Stop"
-          function Yes($v){ "$v" -match '^(?i:true|1|yes|on)$' }
+          $ErrorActionPreference="Stop"
+          function Yes($v){ "$v" -match '^(?i:true|1|yes)$' }
+          $runtime=[int]"${{ inputs.runtime_minutes }}"
+          if (Yes("${{ inputs.quick_test }}")){ $runtime=5 }
+          if ($runtime -gt 360){ $runtime=355 }
+          "RUNTIME_MINUTES=$runtime" | Out-File -Append $env:GITHUB_ENV
 
-          $runtime = [int]"${{ inputs.runtime_minutes }}"
-          if (Yes("${{ inputs.quick_test }}")) { $runtime = 5 }
-          if ($runtime -gt 360) { $runtime = 355 }
-          "RUNTIME_MINUTES=$runtime" | Out-File -FilePath $env:GITHUB_ENV -Append
-
-          # Purge old bullet devices
           if (Yes("${{ inputs.do_purge }}")) {
             try {
-              $auth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("${{ inputs.ts_api_key }}:"))
-              $tn   = [System.Uri]::EscapeDataString("${{ inputs.ts_tailnet }}")
-              $resp = Invoke-RestMethod -Uri "https://api.tailscale.com/api/v2/tailnet/$tn/devices" -Headers @{ Authorization = "Basic $auth" }
-              foreach ($d in $resp.devices) {
-                if ($d.hostname -like "bullet*") {
-                  Invoke-RestMethod -Method Delete -Uri "https://api.tailscale.com/api/v2/device/$($d.id)" -Headers @{ Authorization = "Basic $auth" } -ErrorAction SilentlyContinue
-                }
-              }
-              Write-Host "Purged existing bullet* devices"
-            } catch { Write-Host "Purge warning: $($_.Exception.Message)" }
+              $auth=[Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("${{ inputs.ts_api_key }}:"))
+              $tn=[uri]::EscapeDataString("${{ inputs.ts_tailnet }}")
+              $resp=Invoke-RestMethod "https://api.tailscale.com/api/v2/tailnet/$tn/devices" -Headers @{Authorization="Basic $auth"}
+              foreach($d in $resp.devices){ if($d.hostname -match '^bullet'){ Invoke-RestMethod -Method Delete -Uri "https://api.tailscale.com/api/v2/device/$($d.id)" -Headers @{Authorization="Basic $auth"}}}
+            }catch{Write-Host "purge failed"}
           }
 
-          # Install Tailscale
-          $tsExe = "C:\Program Files\Tailscale\tailscale.exe"
-          if (-not (Test-Path $tsExe)) {
-            $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe"
-            $dst = "$env:TEMP\ts.exe"
-            Invoke-WebRequest -Uri $url -OutFile $dst -UseBasicParsing
-            Start-Process -FilePath $dst -ArgumentList "/quiet" -Wait
+          $exe="C:\Program Files\Tailscale\tailscale.exe"
+          if(-not(Test-Path $exe)){
+            $url="https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe"
+            $dst="$env:TEMP\ts.exe"
+            Invoke-WebRequest $url -OutFile $dst -UseBasicParsing
+            Start-Process $dst -ArgumentList "/quiet" -Wait
           }
-          Start-Service Tailscale -ErrorAction SilentlyContinue
-          & $tsExe logout | Out-Null
-          & $tsExe up --authkey "${{ inputs.ts_authkey }}" --hostname "bullet" --accept-routes --accept-dns=false
+          Start-Service Tailscale
+          & $exe logout | Out-Null
+          & $exe up --authkey "${{ inputs.ts_authkey }}" --hostname "$env:TS_HOSTNAME" --accept-routes --accept-dns=false
+          $ip=& $exe ip -4|select -first 1
+          Write-Host "RDP ready user=$env:RDP_USER pass=$env:RDP_PASS ip=$ip"
 
-          # RDP account
-          $user="Bullettemporary"; $pass="Bullet@12345"
-          $sec = ConvertTo-SecureString $pass -AsPlainText -Force
-          if (-not (Get-LocalUser -Name $user -ErrorAction SilentlyContinue)) {
-            New-LocalUser -Name $user -Password $sec -AccountNeverExpires
-            Add-LocalGroupMember -Group Administrators -Member $user
-            Add-LocalGroupMember -Group "Remote Desktop Users" -Member $user
-          }
+          $sec=ConvertTo-SecureString $env:RDP_PASS -AsPlainText -Force
+          if(-not(Get-LocalUser $env:RDP_USER -EA SilentlyContinue)){
+            New-LocalUser $env:RDP_USER -Password $sec -AccountNeverExpires
+            Add-LocalGroupMember Administrators $env:RDP_USER
+            Add-LocalGroupMember "Remote Desktop Users" $env:RDP_USER
+          } else {Set-LocalUser $env:RDP_USER -Password $sec -AccountNeverExpires}
+          Enable-LocalUser $env:RDP_USER
+          Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" fDenyTSConnections 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-          Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
-          $ip4 = (& $tsExe ip -4 | Select-Object -First 1)
-          Write-Host "RDP login → user=$user pass=$pass ip=$ip4"
 
-      - name: Install RustDesk (EXE, no MSI) + Get ID
+      - name: Install RustDesk
+        continue-on-error: true
         run: |
-          $ErrorActionPreference = "Stop"
-          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          $url="https://github.com/rustdesk/rustdesk/releases/download/1.2.3/rustdesk-1.2.3-x86_64.exe"
+          $exe="$env:TEMP\rustdesk.exe"
+          try { Invoke-WebRequest $url -OutFile $exe -UseBasicParsing; Start-Process $exe -Args "/verysilent /norestart" -Wait; Write-Host "RustDesk installed" } catch { Write-Host "RustDesk install failed" }
 
-          $exe = "$env:TEMP\rustdesk.exe"
-          $url = "https://github.com/rustdesk/rustdesk/releases/download/1.1.9/rustdesk-1.1.9-x86_64.exe"
-          Invoke-WebRequest -Uri $url -OutFile $exe -UseBasicParsing
-
-          if (-not (Test-Path $exe)) { throw "RustDesk EXE not downloaded" }
-
-          Start-Process $exe -ArgumentList "/verysilent /norestart" -Wait
-
-          $rustExe = "C:\Program Files\RustDesk\rustdesk.exe"
-          if (-not (Test-Path $rustExe)) { $rustExe = "C:\Program Files (x86)\RustDesk\rustdesk.exe" }
-          if (-not (Test-Path $rustExe)) { throw "RustDesk not found after EXE install" }
-
-          $pwd = (New-Guid).Guid.Substring(0,8)
-          Start-Process -FilePath $rustExe
-          Start-Sleep -Seconds 12
-          try { & $rustExe --password $pwd } catch {}
-
-          $id = ""
-          for ($i=0; $i -lt 20 -and -not $id; $i++) {
-            try { $out = & $rustExe --get-id 2>$null; if ($out) { $id = $out.Trim() } } catch {}
-            if (-not $id -and (Test-Path "C:\ProgramData\RustDesk\id")) {
-              $maybe = Get-Content "C:\ProgramData\RustDesk\id" -ErrorAction SilentlyContinue | Select-Object -First 1
-              if ($maybe) { $id = $maybe.Trim() }
-            }
-            if (-not $id) { Start-Sleep -Seconds 3 }
-          }
-          if (-not $id) { $id = "unknown" }
-
-          "RUSTDESK_ID=$id"   | Out-File -FilePath $env:GITHUB_ENV -Append
-          "RUSTDESK_PWD=$pwd" | Out-File -FilePath $env:GITHUB_ENV -Append
-
-      - name: Show RustDesk ID + Password in logs
+      - name: Install Avica
+        continue-on-error: true
         run: |
-          Write-Host "RustDesk ID = $env:RUSTDESK_ID"
-          Write-Host "RustDesk PASSWORD = $env:RUSTDESK_PWD"
+          $url="https://www.avica.com/downloads/Avica-Setup-latest.exe"
+          $dst="$env:TEMP\avica.exe"
+          try { Invoke-WebRequest $url -OutFile $dst -UseBasicParsing; Start-Process $dst -Args "/quiet" -Wait; Write-Host "Avica installed" } catch { Write-Host "Avica install failed" }
 
-      - name: Screenshot & Upload to GoFile
+      - name: Install Brave Browser
+        continue-on-error: true
         run: |
-          Add-Type -AssemblyName System.Windows.Forms
-          Add-Type -AssemblyName System.Drawing
-          $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
-          $bmp = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
-          $gfx = [System.Drawing.Graphics]::FromImage($bmp)
-          $gfx.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
-          $file = "$env:GITHUB_WORKSPACE\rustdesk-login.png"
-          $bmp.Save($file, [System.Drawing.Imaging.ImageFormat]::Png)
+          $url="https://github.com/brave/brave-browser/releases/latest/download/BraveBrowserStandaloneSilentSetup.exe"
+          $dst="$env:TEMP\brave.exe"
+          try { Invoke-WebRequest $url -OutFile $dst -UseBasicParsing; Start-Process $dst -Args "/silent /install" -Wait; Write-Host "Brave installed" } catch { Write-Host "Brave install failed" }
 
-          $server = (Invoke-RestMethod https://api.gofile.io/getServer).data.server
-          $resp = Invoke-RestMethod -Uri "https://$server.gofile.io/contents/uploadfile" -Method Post -Form @{ "file" = Get-Item $file }
-          $link = $resp.data.directLink
-          if (-not $link) { $link = $resp.data.downloadPage }
-          Write-Host "RustDesk Screenshot GoFile Link: $link"
+      - name: Install Vivaldi Browser
+        continue-on-error: true
+        run: |
+          $url="https://downloads.vivaldi.com/stable/Vivaldi.6.7.3329.29.x64.exe"
+          $dst="$env:TEMP\vivaldi.exe"
+          try { Invoke-WebRequest $url -OutFile $dst -UseBasicParsing; Start-Process $dst -Args "/silent /install" -Wait; Write-Host "Vivaldi installed" } catch { Write-Host "Vivaldi install failed" }
 
-      - name: Keep alive
+      - name: Install Firefox Nightly
+        continue-on-error: true
+        run: |
+          $url="https://archive.mozilla.org/pub/firefox/nightly/latest-mozilla-central/firefox-setup-nightly-latest.exe"
+          $dst="$env:TEMP\firefox-nightly.exe"
+          try { Invoke-WebRequest $url -OutFile $dst -UseBasicParsing; Start-Process $dst -Args "/S" -Wait; Write-Host "Firefox Nightly installed" } catch { Write-Host "Firefox Nightly install failed" }
+
+      - name: Keep Alive
         run: |
           $end=(Get-Date).AddMinutes([int]$env:RUNTIME_MINUTES)
-          while((Get-Date) -lt $end){ Start-Sleep -Seconds 60 }
+          while((Get-Date)-lt $end){Start-Sleep 60}
+
+      - name: Dispatch next or Stop
+        if: always()
+        run: |
+          Write-Host "dispatch step placeholder"
