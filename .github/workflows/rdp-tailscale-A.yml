@@ -142,11 +142,78 @@ jobs:
 
           if($ok){ Write-Host "RustDesk installed." } else { Write-Host "RustDesk install may have failed (continuing)"; exit 0 }
 
-      - name: Launch RustDesk
+      - name: Launch RustDesk (fast & non-blocking)
         run: |
-          $rd = (Get-ChildItem "C:\Program Files" -Recurse -Filter "rustdesk.exe" -ErrorAction SilentlyContinue | Select-Object -First 1)
-          if(-not $rd){ $rd = (Get-ChildItem "C:\Program Files (x86)" -Recurse -Filter "rustdesk.exe" -ErrorAction SilentlyContinue | Select-Object -First 1) }
-          if($rd){ Start-Process $rd.FullName; Start-Sleep -Seconds 10; Write-Host "RustDesk launched: $($rd.FullName)" } else { Write-Host "RustDesk not found to launch." }
+          $ErrorActionPreference = "SilentlyContinue"
+          $ProgressPreference = "SilentlyContinue"
+
+          function Find-RustDesk {
+            # 1) Known install paths
+            $candidates = @(
+              (Join-Path $env:ProgramFiles    "RustDesk\rustdesk.exe"),
+              (Join-Path $env:ProgramFilesx86 "RustDesk\rustdesk.exe"),
+              (Join-Path $env:LOCALAPPDATA    "Programs\RustDesk\rustdesk.exe")
+            ) | Where-Object { $_ -and (Test-Path $_) }
+            if ($candidates) { return $candidates[0] }
+
+            # 2) Registry (64 & 32-bit)
+            $regKeys = @(
+              'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+              'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+            )
+            foreach ($rk in $regKeys) {
+              $apps = Get-ItemProperty $rk | Where-Object { $_.DisplayName -like 'RustDesk*' }
+              foreach ($a in $apps) {
+                if ($a.InstallLocation) {
+                  $exe = Join-Path $a.InstallLocation 'rustdesk.exe'
+                  if (Test-Path $exe) { return $exe }
+                }
+                if ($a.DisplayIcon) {
+                  $icon = $a.DisplayIcon.Trim('"')
+                  if (Test-Path $icon) { return $icon }
+                }
+              }
+            }
+
+            # 3) Shallow search (depth 2)
+            $roots = @()
+            if ($env:ProgramFiles)    { $roots += $env:ProgramFiles }
+            if ($env:ProgramFilesx86) { $roots += $env:ProgramFilesx86 }
+            foreach ($r in $roots) {
+              try {
+                $hit = Get-ChildItem -Path $r -Filter rustdesk.exe -File -Recurse -Depth 2 | Select-Object -First 1
+                if ($hit) { return $hit.FullName }
+              } catch {}
+            }
+            return $null
+          }
+
+          $exe = Find-RustDesk
+          if (-not $exe) {
+            Write-Host "RustDesk not found on disk (maybe install failed)."
+            exit 0
+          }
+
+          # If already running, don't launch again
+          $existing = Get-Process -Name rustdesk -ErrorAction SilentlyContinue
+          if ($existing) {
+            Write-Host ("RustDesk already running (PID(s): {0})." -f ($existing.Id -join ','))
+            exit 0
+          }
+
+          # Launch without waiting; visible window for screenshot
+          $psi = New-Object System.Diagnostics.ProcessStartInfo
+          $psi.FileName = $exe
+          $psi.WorkingDirectory = Split-Path $exe
+          $psi.UseShellExecute = $true
+          $proc = [System.Diagnostics.Process]::Start($psi)
+
+          if ($proc) {
+            Write-Host ("RustDesk launched: {0} (PID {1})" -f $exe, $proc.Id)
+            Start-Sleep -Seconds 5
+          } else {
+            Write-Host "Failed to start RustDesk (no exception thrown)."
+          }
 
       - name: Take full-screen screenshot (RustDesk visible)
         run: |
