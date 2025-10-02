@@ -1,4 +1,4 @@
-name: "RDP via Tailscale + RustDesk + Avica (Workflow A)"
+name: "RDP via Tailscale + RustDesk (Workflow A)"
 
 on:
   workflow_dispatch:
@@ -142,61 +142,33 @@ jobs:
 
           if($ok){ Write-Host "RustDesk installed." } else { Write-Host "RustDesk install may have failed (continuing)"; exit 0 }
 
-      - name: Install Avica (winget + scraper fallback)
-        continue-on-error: true
+      - name: Launch RustDesk
         run: |
-          $ErrorActionPreference="Continue"
-          function Try-Winget($id){
-            try{
-              winget install --id $id -e --silent --accept-package-agreements --accept-source-agreements --disable-interactivity
-              return $LASTEXITCODE -eq 0
-            }catch{ return $false }
-          }
-
-          $ok = $false
-          # Try common winget IDs (Avica may add official ID later)
-          foreach($id in @("Avica.Avica","Avica.RemoteDesktop","Avica.App")){
-            if(-not $ok){ $ok = Try-Winget $id }
-          }
-
-          if(-not $ok){
-            try{
-              [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-              $page = Invoke-WebRequest -Uri "https://www.avica.com/downloads/" -UseBasicParsing -Headers @{ "User-Agent"="Mozilla/5.0" }
-              $html = $page.Content
-              $m = [regex]::Match($html, 'https?://[^\s"''>]+Avica[^"''>]*\.exe')
-              if($m.Success){
-                $exeUrl = $m.Value
-                $exe = "$env:TEMP\avica-setup.exe"
-                Invoke-WebRequest -Uri $exeUrl -OutFile $exe -UseBasicParsing
-                # Try common silent switches
-                $args = @("/quiet","/silent","/S") | Where-Object { $_ }
-                foreach($a in $args){
-                  try { Start-Process $exe -ArgumentList $a -Wait; $ok = $true; break } catch {}
-                }
-                if(-not $ok){ Start-Process $exe -Wait; $ok = $true }
-              } else {
-                Write-Host "Avica .exe link not found on downloads page."
-              }
-            } catch {
-              Write-Host "Avica fallback failed: $($_.Exception.Message)"
-            }
-          }
-
-          if($ok){ Write-Host "Avica installed (or launched installer)." } else { Write-Host "Avica install may have failed (continuing)." }
-
-      - name: Launch RustDesk & Avica (if installed)
-        run: |
-          $paths = @()
-          # RustDesk
           $rd = (Get-ChildItem "C:\Program Files" -Recurse -Filter "rustdesk.exe" -ErrorAction SilentlyContinue | Select-Object -First 1)
           if(-not $rd){ $rd = (Get-ChildItem "C:\Program Files (x86)" -Recurse -Filter "rustdesk.exe" -ErrorAction SilentlyContinue | Select-Object -First 1) }
-          if($rd){ $paths += $rd.FullName }
-          # Avica
-          $av = (Get-ChildItem "C:\Program Files" -Recurse -Filter "avica*.exe" -ErrorAction SilentlyContinue | Select-Object -First 1)
-          if(-not $av){ $av = (Get-ChildItem "C:\Program Files (x86)" -Recurse -Filter "avica*.exe" -ErrorAction SilentlyContinue | Select-Object -First 1) }
-          foreach($p in $paths){ Start-Process $p }
-          if($paths.Count -gt 0){ Write-Host ("Launched: " + ($paths -join ", ")) } else { Write-Host "Apps not found to launch (continuing)." }
+          if($rd){ Start-Process $rd.FullName; Start-Sleep -Seconds 10; Write-Host "RustDesk launched: $($rd.FullName)" } else { Write-Host "RustDesk not found to launch." }
+
+      - name: Take full-screen screenshot (RustDesk visible)
+        run: |
+          Add-Type -AssemblyName System.Windows.Forms
+          Add-Type -AssemblyName System.Drawing
+          $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+          $bmp = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
+          $gfx = [System.Drawing.Graphics]::FromImage($bmp)
+          $gfx.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
+          $file = "$env:RUNNER_TEMP\rustdesk-login-${{ env.TS_HOSTNAME }}.png"
+          $bmp.Save($file, [System.Drawing.Imaging.ImageFormat]::Png)
+          $gfx.Dispose(); $bmp.Dispose()
+          $size = (Get-Item $file).Length
+          Write-Host "Saved screenshot: $file (`"$([math]::Round($size/1MB,2)) MB`")"
+
+      - name: Upload screenshot artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustdesk-login-${{ env.TS_HOSTNAME }}
+          path: ${{ runner.temp }}/rustdesk-login-${{ env.TS_HOSTNAME }}.png
+          if-no-files-found: error
+          compression-level: 0
 
       - name: Keep alive
         run: |
