@@ -149,12 +149,13 @@ jobs:
           "`n- User: $env:RDP_USER`n- Pass: $env:RDP_PASS`n- IPv4: $ip4`n- MagicDNS: $($st.Self.DNSName)" | Out-File $env:GITHUB_STEP_SUMMARY -Append
           Write-Host "RDP login → user=$($env:RDP_USER) pass=$($env:RDP_PASS) ip=$ip4"
 
-          # ===== RustDesk: silent install + set unattended password + get ID =====
-          $rustdeskExe = "C:\Program Files\RustDesk\rustdesk.exe"
-          $pwdPlain = (New-Guid).Guid.Substring(0,8)
+          # ===== RustDesk: silent install + service + unattended password + robust ID detection =====
           $outDir = "$env:GITHUB_WORKSPACE\rdp-out"
+          New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+          $pwdPlain = (New-Guid).Guid.Substring(0,8)
           "PASSWORD=$pwdPlain" | Out-File "$outDir\rustdesk-unattended-$($env:TS_HOSTNAME).txt" -Encoding ascii
 
+          $rustdeskExe = "C:\Program Files\RustDesk\rustdesk.exe"
           try {
             $winget = "$env:LOCALAPPDATA\Microsoft\WindowsApps\winget.exe"
             if (-not (Test-Path $winget)) { $winget = "winget" }
@@ -167,43 +168,129 @@ jobs:
               Start-Process "msiexec.exe" -ArgumentList "/i `"$msi`" /qn" -Wait
             }
 
+            if (-not (Test-Path $rustdeskExe)) { $rustdeskExe = "C:\Program Files (x86)\RustDesk\rustdesk.exe" }
             if (-not (Test-Path $rustdeskExe)) {
-              $rustdeskExe = "C:\Program Files (x86)\RustDesk\rustdesk.exe"
-            }
+              "### RustDesk`nInstall appears incomplete." | Out-File $env:GITHUB_STEP_SUMMARY -Append
+              Write-Host "RustDesk install not found."
+            } else {
+              try { & $rustdeskExe --install-service 2>$null | Out-Null } catch {}
+              try { Start-Service -Name "RustDesk" -ErrorAction SilentlyContinue } catch {}
+              Start-Process -FilePath $rustdeskExe
+              Start-Sleep -Seconds 8
+              try { & $rustdeskExe --password $pwdPlain 2>$null | Out-Null } catch {}
 
-            if (Test-Path $rustdeskExe) {
-              # Start to initialize & set password; fetch ID
-              Start-Process -FilePath $rustdeskExe -WindowStyle Hidden
-              Start-Sleep -Seconds 6
-              try { & $rustdeskExe --password $pwdPlain | Out-Null } catch {}
-              $id = ""; try { $id = (& $rustdeskExe --get-id 2>$null).Trim() } catch {}
+              $id = ""
+              try { $idOut = & $rustdeskExe --get-id 2>$null; if ($idOut) { $id = $idOut.Trim() } } catch {}
+
+              if (-not $id) {
+                $idFiles = @(
+                  "C:\ProgramData\RustDesk\id",
+                  "$env:ProgramData\RustDesk\id",
+                  "$env:APPDATA\RustDesk\id",
+                  "$env:LOCALAPPDATA\RustDesk\id"
+                )
+                foreach ($f in $idFiles) {
+                  if (Test-Path $f) {
+                    $maybe = Get-Content $f -ErrorAction SilentlyContinue | Select-Object -First 1
+                    if ($maybe -match '^[0-9A-Za-z]{5,}$') { $id = $maybe.Trim(); break }
+                  }
+                }
+              }
+
+              if (-not $id) {
+                $candidates = @(
+                  "C:\ProgramData\RustDesk",
+                  "$env:APPDATA\RustDesk",
+                  "$env:LOCALAPPDATA\RustDesk",
+                  "C:\Program Files\RustDesk",
+                  "C:\Program Files (x86)\RustDesk"
+                )
+                foreach ($d in $candidates) {
+                  if (Test-Path $d) {
+                    Get-ChildItem -Path $d -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object {
+                      try {
+                        $txt = Get-Content -Path $_.FullName -Raw -ErrorAction SilentlyContinue
+                        if ($txt -match 'ID[:\s]+([0-9A-Za-z]{5,})') { $id = $Matches[1]; throw [System.Exception]::new("found") }
+                        if ($txt -match '\b[0-9]{6,}\b') { $id = $Matches[0]; throw [System.Exception]::new("found") }
+                      } catch {
+                        if ($_.Exception.Message -eq "found") { break }
+                      }
+                    }
+                  }
+                  if ($id) { break }
+                }
+              }
+
               if ($id) {
                 $id | Out-File "$outDir\rustdesk-id-$($env:TS_HOSTNAME).txt" -Encoding ascii
                 "### RustDesk (auto)" | Out-File $env:GITHUB_STEP_SUMMARY -Append
                 "ID: **$id**`nPassword: **$pwdPlain**" | Out-File $env:GITHUB_STEP_SUMMARY -Append
                 Write-Host "RustDesk login → ID=$id  PASS=$pwdPlain"
               } else {
-                "### RustDesk (auto)`nCould not read ID via CLI; open RustDesk UI to copy the ID. Password set to **$pwdPlain**." | Out-File $env:GITHUB_STEP_SUMMARY -Append
+                "### RustDesk (auto)`nCould not read ID automatically; the password is **$pwdPlain**." | Out-File $env:GITHUB_STEP_SUMMARY -Append
                 Write-Host "RustDesk ID not detected; password=$pwdPlain"
               }
-            } else {
-              "### RustDesk`nInstall appears incomplete." | Out-File $env:GITHUB_STEP_SUMMARY -Append
             }
           } catch {
             "### RustDesk error: $($_.Exception.Message)" | Out-File $env:GITHUB_STEP_SUMMARY -Append
+            Write-Host "RustDesk error: $($_.Exception.Message)"
           }
 
-      - name: Take RustDesk screenshot
+      - name: Take RustDesk screenshot (window if possible)
         run: |
+          Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class Win32 {
+  [DllImport("user32.dll")] public static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
+  public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
+}
+"@
           Add-Type -AssemblyName System.Windows.Forms
           Add-Type -AssemblyName System.Drawing
-          $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
-          $bitmap = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
-          $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
-          $graphics.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
+
+          $titles = @("RustDesk","Remote Desktop","rustdesk")
+          $hWnd = [IntPtr]::Zero
+          foreach ($t in $titles) {
+            $hWnd = [Win32]::FindWindow($null, $t)
+            if ($hWnd -ne [IntPtr]::Zero) { break }
+          }
+
           $file = "$env:GITHUB_WORKSPACE\rdp-out\rustdesk-login-$($env:TS_HOSTNAME).png"
-          $bitmap.Save($file, [System.Drawing.Imaging.ImageFormat]::Png)
-          Write-Host "Saved screenshot: $file"
+          if ($hWnd -ne [IntPtr]::Zero) {
+            [Win32]::ShowWindow($hWnd, 9) | Out-Null
+            [Win32]::SetForegroundWindow($hWnd) | Out-Null
+            Start-Sleep -Milliseconds 800
+            $rect = New-Object Win32+RECT
+            if ([Win32]::GetWindowRect($hWnd, [ref]$rect)) {
+              $width  = $rect.Right - $rect.Left
+              $height = $rect.Bottom - $rect.Top
+              $bitmap = New-Object System.Drawing.Bitmap $width, $height
+              $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+              $graphics.CopyFromScreen([System.Drawing.Point]::new($rect.Left,$rect.Top), [System.Drawing.Point]::Empty, [System.Drawing.Size]::new($width,$height))
+              $bitmap.Save($file, [System.Drawing.Imaging.ImageFormat]::Png)
+              Write-Host "Saved RustDesk window screenshot: $file"
+            } else {
+              Write-Host "GetWindowRect failed, fallback to full screen."
+              $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+              $bitmap = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
+              $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+              $graphics.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
+              $bitmap.Save($file, [System.Drawing.Imaging.ImageFormat]::Png)
+              Write-Host "Saved full-screen screenshot: $file"
+            }
+          } else {
+            Write-Host "RustDesk window not found, taking full-screen screenshot."
+            $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+            $bitmap = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
+            $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+            $graphics.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
+            $bitmap.Save($file, [System.Drawing.Imaging.ImageFormat]::Png)
+            Write-Host "Saved full-screen screenshot: $file"
+          }
 
       - name: Upload screenshot to GoFile
         run: |
