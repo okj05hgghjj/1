@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       ts_tailnet:        { description: "Tailscale tailnet (e.g. you@gmail.com)", required: true }
-      ts_api_key:        { description: "Tailscale API key (device admin, key only — no 'Bearer')", required: true }
+      ts_api_key:        { description: "Tailscale API key (device admin, no 'Bearer')", required: true }
       ts_authkey:        { description: "Tailscale Auth key (reusable or ephemeral)", required: true }
       quick_test:
         description: "Run 5-minute quick test"
@@ -12,21 +12,15 @@ on:
         default: false
       runtime_minutes:   { description: "Runtime (max 360; default 355; ignored if quick_test=true)", required: false, default: "355" }
       do_purge:          { description: "Purge bullet* at start", required: false, default: "true" }
-      cycles:            { description: "0=infinite; N=handoffs left incl. this run", required: false, default: "0" }
-      stop_dryrun_first:
-        description: "At cycles end: dry-run Stop once before real purge"
-        required: false
-        default: true
-        type: boolean
       multi_rdp:
-        description: "Enable multiple RDP instances?"
+        description: "Enable multiple RDPs"
         required: false
         default: false
         type: boolean
       multi_count:
-        description: "How many RDP instances? (1–10)"
+        description: "Number of RDPs (1–10)"
         required: false
-        default: "2"
+        default: "1"
 
 permissions:
   contents: read
@@ -37,154 +31,86 @@ defaults:
     shell: pwsh
 
 jobs:
-  setup:
-    runs-on: ubuntu-latest
-    outputs:
-      multi:  ${{ steps.eval.outputs.multi }}
-      count:  ${{ steps.eval.outputs.count }}
-      matrix: ${{ steps.eval.outputs.matrix }}
-    steps:
-      - name: Evaluate inputs & build matrix
-        id: eval
-        run: |
-          $multi = "${{ inputs.multi_rdp }}"
-          $countIn = "${{ inputs.multi_count }}"
-          if (-not ($countIn -match '^\d+$')) { $countIn = "1" }
-          $count = [int]$countIn
-          if ($multi -eq "true") {
-            if ($count -gt 10) { $count = 10 }
-            "multi=true"  | Out-File $env:GITHUB_OUTPUT -Append
-            "count=$count" | Out-File $env:GITHUB_OUTPUT -Append
-          } else {
-            "multi=false" | Out-File $env:GITHUB_OUTPUT -Append
-            "count=1"     | Out-File $env:GITHUB_OUTPUT -Append
-            $count = 1
-          }
-          $include = @(); for ($i=1; $i -le $count; $i++){ $include += @{ id = $i } }
-          $matrixJson = @{ include = $include } | ConvertTo-Json -Compress
-          "matrix=$matrixJson" | Out-File $env:GITHUB_OUTPUT -Append
-
   rdp:
-    needs: setup
     runs-on: windows-2025
-    strategy:
-      matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
-      max-parallel: 10
-    concurrency:
-      group: rdp-bullet-${{ github.run_id }}-${{ matrix.id }}
-      cancel-in-progress: false
     timeout-minutes: 370
-    env:
-      RDP_USER:    Bullettemporary
-      RDP_PASS:    Bullet@12345
-      X_DIR:       C:\Users\Public\Transfer
 
     steps:
-      - name: Compute hostname
+      - name: Decide hostname
         run: |
-          if ("${{ needs.setup.outputs.multi }}" -eq "true") {
-            $env:TS_HOSTNAME = "bullet${{ matrix.id }}"
+          if ("${{ inputs.multi_rdp }}" -eq "true") {
+            $env:TS_HOSTNAME = "bullet1"
           } else {
             $env:TS_HOSTNAME = "bullet"
           }
           "TS_HOSTNAME=$env:TS_HOSTNAME" | Out-File -FilePath $env:GITHUB_ENV -Append
-          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\rdp-out" | Out-Null
 
-      - name: Setup & Run (Tailscale + RDP + RustDesk) — A
+      - name: Setup Tailscale + RDP
         run: |
           $ErrorActionPreference = "Stop"
-          function IntOr($v,$def){ if("$v" -match '^\d+$'){ [int]$v } else { [int]$def } }
-          function Yes($v){ "$v" -match '^(?i:true|1|yes|on)$' }
 
-          # ----- Runtime (decide once) -----
-          $runtime = IntOr("${{ inputs.runtime_minutes }}", 355)
-          if (Yes("${{ inputs.quick_test }}")) { $runtime = 5 }
-          if (-not (Yes("${{ inputs.quick_test }}")) -and $runtime -lt 6) { $runtime = 355 }
+          # Runtime
+          $runtime = [int]"${{ inputs.runtime_minutes }}"
+          if ("${{ inputs.quick_test }}" -eq "true") { $runtime = 5 }
           if ($runtime -gt 360) { $runtime = 355 }
           "RUNTIME_MINUTES=$runtime" | Out-File -FilePath $env:GITHUB_ENV -Append
-          Write-Host "Runtime (minutes): $runtime"
+          Write-Host "Runtime: $runtime minutes"
 
-          # ----- Optional purge bullet* at start -----
-          if (Yes("${{ inputs.do_purge }}")) {
-            $auth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("${{ inputs.ts_api_key }}:"))
-            $tn   = [System.Uri]::EscapeDataString("${{ inputs.ts_tailnet }}")
-            try {
-              $resp = Invoke-RestMethod -Uri "https://api.tailscale.com/api/v2/tailnet/$tn/devices" -Headers @{ Authorization = "Basic $auth" }
-              foreach ($d in $resp.devices) {
-                if ($d.hostname -match '^bullet[0-9]*$') {
-                  Invoke-RestMethod -Method Delete -Uri "https://api.tailscale.com/api/v2/device/$($d.id)" -Headers @{ Authorization = "Basic $auth" } -ErrorAction SilentlyContinue
-                }
-              }
-              Write-Host "Purged existing bullet* devices (if any)."
-            } catch { Write-Host "Purge failed: $($_.Exception.Message)" }
-          }
-
-          # ----- Tailscale install/login -----
+          # Install Tailscale
           $tsExe = "C:\Program Files\Tailscale\tailscale.exe"
           if (-not (Test-Path $tsExe)) {
-            $url = 'https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe'
-            $dst = "$env:TEMP\tailscale-setup.exe"
-            Invoke-WebRequest -Uri "$url" -OutFile "$dst" -UseBasicParsing
+            $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe"
+            $dst = "$env:TEMP\ts.exe"
+            Invoke-WebRequest -Uri $url -OutFile $dst -UseBasicParsing
             Start-Process -FilePath $dst -ArgumentList "/quiet" -Wait
           }
           Start-Service Tailscale -ErrorAction SilentlyContinue
-          & $tsExe logout | Out-Null
-          & $tsExe up --authkey "${{ inputs.ts_authkey }}" --hostname "$env:TS_HOSTNAME" --accept-routes --accept-dns=false
-          Start-Sleep -Seconds 2
+          & $tsExe up --authkey "${{ inputs.ts_authkey }}" --hostname $env:TS_HOSTNAME --accept-routes --accept-dns=false
 
-          # ----- Enable RDP account -----
-          $u=$env:RDP_USER; $p=$env:RDP_PASS
-          $sec = ConvertTo-SecureString $p -AsPlainText -Force
-          if (-not (Get-LocalUser -Name $u -ErrorAction SilentlyContinue)) {
-            New-LocalUser -Name $u -Password $sec -AccountNeverExpires
-            Add-LocalGroupMember -Group Administrators -Member $u
-            Add-LocalGroupMember -Group "Remote Desktop Users" -Member $u
-          } else {
-            Set-LocalUser -Name $u -Password $sec -AccountNeverExpires
-            Enable-LocalUser -Name $u
+          # Enable RDP account
+          $user="Bullettemporary"; $pass="Bullet@12345"
+          $sec = ConvertTo-SecureString $pass -AsPlainText -Force
+          if (-not (Get-LocalUser -Name $user -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name $user -Password $sec -AccountNeverExpires
+            Add-LocalGroupMember -Group Administrators -Member $user
+            Add-LocalGroupMember -Group "Remote Desktop Users" -Member $user
           }
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
           Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
 
           $ip4 = (& $tsExe ip -4 | Select-Object -First 1)
-          $st  = & $tsExe status --json | ConvertFrom-Json
-          Write-Host "RDP login → user=$($env:RDP_USER) pass=$($env:RDP_PASS) ip=$ip4 dns=$($st.Self.DNSName)"
+          Write-Host "RDP login → user=$user pass=$pass ip=$ip4"
 
-          # ----- RustDesk: install via pinned MSI, set password, get ID -----
+      - name: Install RustDesk + Get ID
+        run: |
           $msiUrl = "https://github.com/rustdesk/rustdesk/releases/download/1.2.3/rustdesk-1.2.3-x86_64.msi"
           $msi = "$env:TEMP\rustdesk.msi"
-          Invoke-WebRequest -Uri "$msiUrl" -OutFile "$msi" -UseBasicParsing
-          Start-Process "msiexec.exe" -ArgumentList "/i `"$msi`" /qn" -Wait
+          Invoke-WebRequest -Uri $msiUrl -OutFile $msi -UseBasicParsing
+          Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn" -Wait
 
-          $exe1 = "C:\Program Files\RustDesk\rustdesk.exe"
-          $exe2 = "C:\Program Files (x86)\RustDesk\rustdesk.exe"
-          $rustexe = if (Test-Path $exe1) { $exe1 } elseif (Test-Path $exe2) { $exe2 } else { "" }
-          if ([string]::IsNullOrEmpty($rustexe)) { throw "RustDesk not found after MSI install." }
+          $exe = "C:\Program Files\RustDesk\rustdesk.exe"
+          if (-not (Test-Path $exe)) { $exe = "C:\Program Files (x86)\RustDesk\rustdesk.exe" }
+          if (-not (Test-Path $exe)) { throw "RustDesk not found" }
 
-          $pwdPlain = (New-Guid).Guid.Substring(0,8)
-          Start-Process -FilePath $rustexe
-          Start-Sleep -Seconds 12
-          try { & $rustexe --password $pwdPlain } catch {}
+          $pwd = (New-Guid).Guid.Substring(0,8)
+          try { & $exe --password $pwd } catch {}
+          Start-Sleep -Seconds 10
 
           $id = ""
-          for ($i=0; $i -lt 30 -and -not $id; $i++) {
-            try { $out = & $rustexe --get-id 2>$null; if ($out) { $id = $out.Trim() } } catch {}
-            if (-not $id -and (Test-Path "C:\ProgramData\RustDesk\id")) {
-              $maybe = Get-Content "C:\ProgramData\RustDesk\id" -ErrorAction SilentlyContinue | Select-Object -First 1
-              if ($maybe -match '^[0-9A-Za-z]{5,}$') { $id = $maybe.Trim() }
-            }
-            if (-not $id) { Start-Sleep -Seconds 3 }
+          if (Test-Path "C:\ProgramData\RustDesk\id") {
+            $id = Get-Content "C:\ProgramData\RustDesk\id" | Select-Object -First 1
           }
+          if (-not $id) { $id="unknown" }
 
-          if ($id) { "RUSTDESK_ID=$id" | Out-File -FilePath $env:GITHUB_ENV -Append } else { "RUSTDESK_ID=unknown" | Out-File -FilePath $env:GITHUB_ENV -Append }
-          "RUSTDESK_PWD=$pwdPlain" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "RUSTDESK_ID=$id"   | Out-File -FilePath $env:GITHUB_ENV -Append
+          "RUSTDESK_PWD=$pwd" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Print RustDesk credentials to logs
+      - name: Show RustDesk ID + Password in logs
         run: |
           Write-Host "RustDesk ID = $env:RUSTDESK_ID"
           Write-Host "RustDesk PASSWORD = $env:RUSTDESK_PWD"
 
-      - name: Screenshot RustDesk login (full screen)
+      - name: Screenshot & Upload to GoFile
         run: |
           Add-Type -AssemblyName System.Windows.Forms
           Add-Type -AssemblyName System.Drawing
@@ -192,85 +118,16 @@ jobs:
           $bmp = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
           $gfx = [System.Drawing.Graphics]::FromImage($bmp)
           $gfx.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
-          $file = "$env:GITHUB_WORKSPACE\rdp-out\rustdesk-login-$($env:TS_HOSTNAME).png"
+          $file = "$env:GITHUB_WORKSPACE\rustdesk-login.png"
           $bmp.Save($file, [System.Drawing.Imaging.ImageFormat]::Png)
-          Write-Host "Screenshot saved: $file"
 
-      - name: Upload screenshot to GoFile (DIRECT link)
-        run: |
-          $file = "$env:GITHUB_WORKSPACE\rdp-out\rustdesk-login-$($env:TS_HOSTNAME).png"
-          try {
-            $serverResp = Invoke-RestMethod -Uri "https://api.gofile.io/getServer"
-            $server = $serverResp.data.server
-            $uploadUri = "https://$server.gofile.io/contents/uploadfile"
-            $resp = Invoke-RestMethod -Uri $uploadUri -Method Post -Form @{ "file" = Get-Item $file }
-            $link = $resp.data.directLink
-            if (-not $link) { $link = $resp.data.downloadPage }
-            Write-Host "GoFile direct link: $link"
-          } catch {
-            Write-Host "GoFile upload failed: $($_.Exception.Message)"
-          }
+          $server = (Invoke-RestMethod https://api.gofile.io/getServer).data.server
+          $resp = Invoke-RestMethod -Uri "https://$server.gofile.io/contents/uploadfile" -Method Post -Form @{ "file" = Get-Item $file }
+          $link = $resp.data.directLink
+          if (-not $link) { $link = $resp.data.downloadPage }
+          Write-Host "RustDesk Screenshot GoFile Link: $link"
 
       - name: Keep alive
         run: |
-          $ErrorActionPreference = "Stop"
-          if (-not $env:RUNTIME_MINUTES -or -not ($env:RUNTIME_MINUTES -match '^\d+$')) {
-            throw "RUNTIME_MINUTES is not set correctly"
-          }
-          $runtime = [int]$env:RUNTIME_MINUTES
-          $end=(Get-Date).AddMinutes($runtime)
+          $end=(Get-Date).AddMinutes([int]$env:RUNTIME_MINUTES)
           while((Get-Date) -lt $end){ Start-Sleep -Seconds 60 }
-
-      - name: Dispatch next or stop
-        if: always()
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          function Yes($v){ "$v" -match '^(?i:true|1|yes|on)$' }
-          $cyclesIn = [int]"${{ inputs.cycles }}"
-          $dryFirst = Yes("${{ inputs.stop_dryrun_first }}")
-          $stopMax  = 10
-
-          if ($cyclesIn -gt 0) {
-            $next = $cyclesIn - 1
-            if ($next -le 0) {
-              $url = "https://api.github.com/repos/${{ github.repository }}/actions/workflows/rdp-tailscale-stop.yml/dispatches"
-              $hdr = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = "application/vnd.github+json" }
-              $basePayload = @{
-                ts_tailnet      = "${{ inputs.ts_tailnet }}"
-                ts_api_key      = "${{ inputs.ts_api_key }}"
-                base_prefix     = "bullet"
-                max_count       = "$stopMax"
-                rdp_user        = "Bullettemporary"
-                rdp_pass        = "Bullet@12345"
-                multi_requested = "${{ inputs.multi_count }}"
-              }
-              if ($dryFirst) {
-                $payloadDry = $basePayload + @{ dry_run = "true" }
-                $bodyDry = @{ ref = "${{ github.ref_name }}"; inputs = $payloadDry } | ConvertTo-Json -Depth 20
-                Invoke-WebRequest -Method POST -Uri $url -Headers $hdr -Body $bodyDry | Out-Null
-                Start-Sleep -Seconds 15
-              }
-              $payloadPurge = $basePayload + @{ dry_run = "false" }
-              $bodyPurge = @{ ref = "${{ github.ref_name }}"; inputs = $payloadPurge } | ConvertTo-Json -Depth 20
-              Invoke-WebRequest -Method POST -Uri $url -Headers $hdr -Body $bodyPurge | Out-Null
-              exit 0
-            }
-          } else { $next = 0 }
-
-          $payload = @{
-            ts_tailnet        = "${{ inputs.ts_tailnet }}"
-            ts_api_key        = "${{ inputs.ts_api_key }}"
-            ts_authkey        = "${{ inputs.ts_authkey }}"
-            quick_test        = "${{ inputs.quick_test }}"
-            runtime_minutes   = "${{ inputs.runtime_minutes }}"
-            do_purge          = "${{ inputs.do_purge }}"
-            cycles            = "$next"
-            stop_dryrun_first = "${{ inputs.stop_dryrun_first }}"
-            multi_rdp         = "${{ inputs.multi_rdp }}"
-            multi_count       = "${{ inputs.multi_count }}"
-          }
-          $url2 = "https://api.github.com/repos/${{ github.repository }}/actions/workflows/rdp-tailscale-B.yml/dispatches"
-          $hdr2 = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = "application/vnd.github+json" }
-          $body2 = @{ ref = "${{ github.ref_name }}"; inputs = $payload } | ConvertTo-Json -Depth 20
-          Invoke-WebRequest -Method POST -Uri $url2 -Headers $hdr2 -Body $body2 | Out-Null
