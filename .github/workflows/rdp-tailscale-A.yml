@@ -215,7 +215,40 @@ jobs:
             Write-Host "Failed to start RustDesk (no exception thrown)."
           }
 
-      - name: Take full-screen screenshot (RustDesk visible)
+      - name: Prepare desktop (hide Tailscale UI, focus RustDesk)
+        run: |
+          $ErrorActionPreference = "SilentlyContinue"
+
+          # Close only the Tailscale UI (service stays running)
+          Stop-Process -Name "Tailscale" -Force -ErrorAction SilentlyContinue
+
+          # Bring RustDesk to foreground & maximize (if it has a main window)
+          Add-Type @"
+          using System;
+          using System.Runtime.InteropServices;
+          public static class Win32 {
+            [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+            [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
+          }
+"@
+
+          $rd = $null
+          for ($i=0; $i -lt 15; $i++) {
+            $rd = Get-Process -Name rustdesk -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($rd -and $rd.MainWindowHandle -ne 0) { break }
+            Start-Sleep -Seconds 1
+          }
+
+          if ($rd -and $rd.MainWindowHandle -ne 0) {
+            [Win32]::ShowWindowAsync($rd.MainWindowHandle, 3) | Out-Null  # SW_MAXIMIZE
+            [Win32]::SetForegroundWindow($rd.MainWindowHandle) | Out-Null
+            Write-Host ("RustDesk focused & maximized (PID {0})." -f $rd.Id)
+            Start-Sleep -Seconds 2
+          } else {
+            Write-Host "Warning: RustDesk main window not found; proceeding with screenshot anyway."
+          }
+
+      - name: Take full-screen screenshot (RustDesk only)
         run: |
           Add-Type -AssemblyName System.Windows.Forms
           Add-Type -AssemblyName System.Drawing
