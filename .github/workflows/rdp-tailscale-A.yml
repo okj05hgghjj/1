@@ -21,7 +21,7 @@ on:
         required: false
         default: "355"
       do_purge:
-        description: "Purge bullet* at start"
+        description: "Purge bullet* devices at start"
         required: false
         default: "true"
       cycles:
@@ -68,7 +68,7 @@ jobs:
       RDP_PASS:    Bullet@12345
 
     steps:
-      - name: Decide hostname
+      - name: Setup hostname
         run: |
           if ([int]"${{ inputs.rdp_count }}" -gt 1) {
             $env:TS_HOSTNAME = "bullet${{ matrix.id }}"
@@ -76,6 +76,7 @@ jobs:
             $env:TS_HOSTNAME = "bullet"
           }
           "TS_HOSTNAME=$env:TS_HOSTNAME" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "Hostname: $env:TS_HOSTNAME"
 
       - name: Setup Tailscale + RDP
         run: |
@@ -90,7 +91,7 @@ jobs:
           if ($runtime -gt 360) { $runtime = 355 }
           "RUNTIME_MINUTES=$runtime" | Out-File -Append $env:GITHUB_ENV
 
-          # --- purge bullet* devices (optional) ---
+          # --- optional purge bullet* via API ---
           if (Yes("${{ inputs.do_purge }}")) {
             try{
               $auth=[Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("${{ inputs.ts_api_key }}:"))
@@ -105,7 +106,7 @@ jobs:
             } catch { Write-Host "Purge warning: $($_.Exception.Message)" }
           }
 
-          # --- install & login tailscale ---
+          # --- install & up tailscale ---
           $ts="C:\Program Files\Tailscale\tailscale.exe"
           if(-not(Test-Path $ts)){
             $url="https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe"
@@ -118,7 +119,7 @@ jobs:
           & $ts up --authkey "${{ inputs.ts_authkey }}" --hostname "$env:TS_HOSTNAME" --accept-routes --accept-dns=false
           $ip=& $ts ip -4 | Select-Object -First 1
 
-          # --- enable rdp & user ---
+          # --- enable RDP & user ---
           $u=$env:RDP_USER; $p=$env:RDP_PASS
           $sec=ConvertTo-SecureString $p -AsPlainText -Force
           if(-not(Get-LocalUser -Name $u -EA SilentlyContinue)){
@@ -134,12 +135,10 @@ jobs:
 
           Write-Host "RDP login → user=$u pass=$p ip=$ip dns=$env:TS_HOSTNAME"
 
-      - name: Install RustDesk (winget + safe fallback)
+      - name: Install RustDesk (winget + fallback)
         run: |
           $ErrorActionPreference="SilentlyContinue"
-          # Try winget first (most reliable on GH runners)
           winget install --id RustDesk.RustDesk -e --silent --accept-package-agreements --accept-source-agreements --disable-interactivity
-          # Fallback to EXE if winget failed to install
           $paths=@(
             "C:\Program Files\RustDesk\rustdesk.exe",
             "C:\Program Files (x86)\RustDesk\rustdesk.exe",
@@ -147,7 +146,7 @@ jobs:
           )
           $present = $paths | Where-Object { Test-Path $_ } | Select-Object -First 1
           if(-not $present){
-            Write-Host "Winget did not place RustDesk; trying direct EXE fallback..."
+            Write-Host "Winget didn’t place RustDesk; trying EXE fallback…"
             [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
             $url="https://github.com/rustdesk/rustdesk/releases/download/1.2.3/rustdesk-1.2.3-x86_64.exe"
             $exe="$env:TEMP\rustdesk.exe"
@@ -158,45 +157,59 @@ jobs:
           }
           Write-Host "RustDesk install step completed."
 
-      - name: Launch RustDesk (robust, non-blocking)
+      - name: Launch RustDesk
         run: |
           $ErrorActionPreference="SilentlyContinue"
           $candidates=@(
             "C:\Program Files\RustDesk\rustdesk.exe",
             "C:\Program Files (x86)\RustDesk\rustdesk.exe",
-            "$env:LOCALAPPDATA\Programs\RustDesk\rustdesk.exe",
-            "$env:ProgramFiles\RustDesk\rustdesk.exe",
-            "$env:ProgramFiles(x86)\RustDesk\rustdesk.exe"
-          ) | Where-Object { $_ -and (Test-Path $_) }
+            "$env:LOCALAPPDATA\Programs\RustDesk\rustdesk.exe"
+          ) | Where-Object { Test-Path $_ }
           $exe = $candidates | Select-Object -First 1
           if(-not $exe){
-            # quick 2-depth search (fast; avoids the long blocking search)
             try {
               $hit = Get-ChildItem -Path "C:\Program Files","C:\Program Files (x86)" -Filter rustdesk.exe -File -Recurse -Depth 2 | Select-Object -First 1
               if($hit){ $exe=$hit.FullName }
             } catch {}
           }
           if($exe){
-            Write-Host "RustDesk path: $exe"
-            if(-not (Get-Process -Name rustdesk -ErrorAction SilentlyContinue)){
+            if(-not (Get-Process -Name rustdesk -EA SilentlyContinue)){
               Start-Process -FilePath $exe -WindowStyle Normal
               Start-Sleep -Seconds 8
-            } else {
-              Write-Host "RustDesk already running."
             }
+            Write-Host "RustDesk ready."
           } else {
-            Write-Host "RustDesk not found on disk (continuing)."
+            Write-Host "RustDesk not found (continuing)."
           }
 
-      - name: Close Tailscale UI and focus + maximize RustDesk
+      - name: Close Tailscale popup + focus & maximize RustDesk
         run: |
           $ErrorActionPreference="SilentlyContinue"
-          # Close the popup UI without touching the service
-          Stop-Process -Name "TailscaleSystemUI" -Force -ErrorAction SilentlyContinue
-          Stop-Process -Name "Tailscale" -Force -ErrorAction SilentlyContinue
 
-          Start-Sleep -Seconds 3
-          # Focus & maximize RustDesk via COM
+          # user32 helpers
+          Add-Type @"
+          using System;
+          using System.Runtime.InteropServices;
+          public class Win32 {
+            [DllImport("user32.dll")]
+            public static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
+            [DllImport("user32.dll")]
+            [return: MarshalAs(UnmanagedType.Bool)]
+            public static extern bool PostMessage(IntPtr hWnd, uint Msg, int wParam, int lParam);
+          }
+"@
+
+          # Close visible Tailscale popup window if present
+          $hwnd = [Win32]::FindWindow([NullString]::Value, "Tailscale")
+          if ($hwnd -ne [IntPtr]::Zero) {
+            [Win32]::PostMessage($hwnd, 0x0010, 0, 0) | Out-Null  # WM_CLOSE
+            Write-Host "Closed Tailscale popup window."
+            Start-Sleep -Seconds 2
+          } else {
+            Write-Host "No Tailscale popup found."
+          }
+
+          # Focus & maximize RustDesk
           $rd = $null
           for ($i=0; $i -lt 12; $i++) {
             $rd = Get-Process -Name rustdesk -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -247,12 +260,33 @@ jobs:
           if-no-files-found: error
           compression-level: 0
 
-      - name: Keep alive
+      - name: Keep alive (auto-close Tailscale popup every minute)
         run: |
-          $mins = [int]"${{ inputs.runtime_minutes }}"
-          if ("${{ inputs.quick_test }}" -match '^(?i:true|1|yes|on)$') { $mins = 5 } elseif ($mins -lt 6 -or $mins -gt 360) { $mins = 355 }
-          $end=(Get-Date).AddMinutes($mins)
-          while((Get-Date) -lt $end){ Start-Sleep -Seconds 60 }
+          $mins = [int]"${{ env.RUNTIME_MINUTES }}"
+          $end = (Get-Date).AddMinutes($mins)
+
+          Add-Type @"
+          using System;
+          using System.Runtime.InteropServices;
+          public class Win32 {
+            [DllImport("user32.dll")]
+            public static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
+            [DllImport("user32.dll")]
+            [return: MarshalAs(UnmanagedType.Bool)]
+            public static extern bool PostMessage(IntPtr hWnd, uint Msg, int wParam, int lParam);
+          }
+"@
+
+          while ((Get-Date) -lt $end) {
+            try {
+              $hwnd = [Win32]::FindWindow([NullString]::Value, "Tailscale")
+              if ($hwnd -ne [IntPtr]::Zero) {
+                [Win32]::PostMessage($hwnd, 0x0010, 0, 0) | Out-Null  # WM_CLOSE
+                Write-Host "Closed a reappeared Tailscale popup."
+              }
+            } catch {}
+            Start-Sleep -Seconds 60
+          }
 
       - name: Dispatch next or stop
         if: always()
