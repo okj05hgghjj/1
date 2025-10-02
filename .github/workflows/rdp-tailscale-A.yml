@@ -101,7 +101,6 @@ jobs:
           "RUNTIME_MINUTES=$runtime" | Out-File -FilePath $env:GITHUB_ENV -Append
           "### Instance $env:TS_HOSTNAME" | Out-File $env:GITHUB_STEP_SUMMARY -Append
           "**Scheduled runtime:** $runtime minutes" | Out-File $env:GITHUB_STEP_SUMMARY -Append
-          Write-Host "Runtime (minutes): $runtime"
 
           # ----- Purge bullet* devices at start (optional) -----
           if (Yes("${{ inputs.do_purge }}")) {
@@ -149,7 +148,7 @@ jobs:
           "`n- User: $env:RDP_USER`n- Pass: $env:RDP_PASS`n- IPv4: $ip4`n- MagicDNS: $($st.Self.DNSName)" | Out-File $env:GITHUB_STEP_SUMMARY -Append
           Write-Host "RDP login → user=$($env:RDP_USER) pass=$($env:RDP_PASS) ip=$ip4"
 
-          # ===== RustDesk: silent install + service + unattended password + robust ID detection =====
+          # ===== RustDesk: install + service + password + robust ID detection (with retries) =====
           $outDir = "$env:GITHUB_WORKSPACE\rdp-out"
           New-Item -ItemType Directory -Force -Path $outDir | Out-Null
           $pwdPlain = (New-Guid).Guid.Substring(0,8)
@@ -157,8 +156,7 @@ jobs:
 
           $rustdeskExe = "C:\Program Files\RustDesk\rustdesk.exe"
           try {
-            $winget = "$env:LOCALAPPDATA\Microsoft\WindowsApps\winget.exe"
-            if (-not (Test-Path $winget)) { $winget = "winget" }
+            $winget = "$env:LOCALAPPDATA\Microsoft\WindowsApps\winget.exe"; if (-not (Test-Path $winget)) { $winget = "winget" }
             try {
               & $winget install --id RustDesk.RustDesk -e --silent --accept-package-agreements --accept-source-agreements
             } catch {
@@ -171,28 +169,22 @@ jobs:
             if (-not (Test-Path $rustdeskExe)) { $rustdeskExe = "C:\Program Files (x86)\RustDesk\rustdesk.exe" }
             if (-not (Test-Path $rustdeskExe)) {
               "### RustDesk`nInstall appears incomplete." | Out-File $env:GITHUB_STEP_SUMMARY -Append
-              Write-Host "RustDesk install not found."
             } else {
               try { & $rustdeskExe --install-service 2>$null | Out-Null } catch {}
               try { Start-Service -Name "RustDesk" -ErrorAction SilentlyContinue } catch {}
-
-              # start GUI once so we can screenshot it
               Start-Process -FilePath $rustdeskExe
-              Start-Sleep -Seconds 8
-
-              # set unattended password
+              Start-Sleep -Seconds 6
               try { & $rustdeskExe --password $pwdPlain 2>$null | Out-Null } catch {}
 
-              # get ID (CLI then file/log fallbacks)
+              # Try to obtain ID (retry up to 90s)
               $id = ""
-              try { $idOut = & $rustdeskExe --get-id 2>$null; if ($idOut) { $id = $idOut.Trim() } } catch {}
+              for ($i=0; $i -lt 30 -and -not $id; $i++) {
+                try { $out = & $rustdeskExe --get-id 2>$null; if ($out) { $id = $out.Trim() } } catch {}
+                if (-not $id) { Start-Sleep -Seconds 3 }
+              }
+
               if (-not $id) {
-                $idFiles = @(
-                  "C:\ProgramData\RustDesk\id",
-                  "$env:ProgramData\RustDesk\id",
-                  "$env:APPDATA\RustDesk\id",
-                  "$env:LOCALAPPDATA\RustDesk\id"
-                )
+                $idFiles = @("C:\ProgramData\RustDesk\id", "$env:ProgramData\RustDesk\id", "$env:APPDATA\RustDesk\id", "$env:LOCALAPPDATA\RustDesk\id")
                 foreach ($f in $idFiles) {
                   if (Test-Path $f) {
                     $maybe = Get-Content $f -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -200,24 +192,17 @@ jobs:
                   }
                 }
               }
+
               if (-not $id) {
-                $candidates = @(
-                  "C:\ProgramData\RustDesk",
-                  "$env:APPDATA\RustDesk",
-                  "$env:LOCALAPPDATA\RustDesk",
-                  "C:\Program Files\RustDesk",
-                  "C:\Program Files (x86)\RustDesk"
-                )
-                foreach ($d in $candidates) {
-                  if (Test-Path $d) {
-                    Get-ChildItem -Path $d -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object {
+                $roots = @("C:\ProgramData\RustDesk", "$env:APPDATA\RustDesk", "$env:LOCALAPPDATA\RustDesk", "C:\Program Files\RustDesk", "C:\Program Files (x86)\RustDesk")
+                foreach ($r in $roots) {
+                  if (Test-Path $r) {
+                    Get-ChildItem -Path $r -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object {
                       try {
                         $txt = Get-Content -Path $_.FullName -Raw -ErrorAction SilentlyContinue
-                        if ($txt -match 'ID[:\s]+([0-9A-Za-z]{5,})') { $id = $Matches[1]; throw [System.Exception]::new("found") }
-                        if ($txt -match '\b[0-9]{6,}\b') { $id = $Matches[0]; throw [System.Exception]::new("found") }
-                      } catch {
-                        if ($_.Exception.Message -eq "found") { break }
-                      }
+                        if ($txt -match 'ID[:\s]+([0-9A-Za-z]{5,})') { $script:id = $Matches[1]; throw [System.Exception]::new("found") }
+                        if ($txt -match '\b[0-9]{6,}\b') { $script:id = $Matches[0]; throw [System.Exception]::new("found") }
+                      } catch { if ($_.Exception.Message -eq "found") { } }
                     }
                   }
                   if ($id) { break }
@@ -236,54 +221,85 @@ jobs:
             }
           } catch {
             "### RustDesk error: $($_.Exception.Message)" | Out-File $env:GITHUB_STEP_SUMMARY -Append
-            Write-Host "RustDesk error: $($_.Exception.Message)"
           }
 
-      - name: Take RustDesk screenshot (full screen, after focusing RustDesk)
+      - name: Focus RustDesk and take window screenshot (fallback to full-screen)
         run: |
-          $ErrorActionPreference = "SilentlyContinue"
-          # close any Tailscale UI window so it doesn't cover RustDesk
-          Get-Process | Where-Object { $_.MainWindowTitle -match 'Tailscale' } | Stop-Process -Force
-          Start-Sleep -Seconds 1
-          # try to bring RustDesk to front by re-launching
-          $exe1 = "C:\Program Files\RustDesk\rustdesk.exe"
-          $exe2 = "C:\Program Files (x86)\RustDesk\rustdesk.exe"
-          if (Test-Path $exe1) { Start-Process $exe1 } elseif (Test-Path $exe2) { Start-Process $exe2 }
-          Start-Sleep -Seconds 3
+          # Minimize the agent console so it doesn't block the RustDesk UI
+          Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public class W32 {
+  [DllImport("user32.dll", SetLastError=true, CharSet=CharSet.Auto)]
+  public static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
+  public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
+}
+'@
+          try {
+            $agent = [W32]::FindWindow($null, "C:\ProgramData\GitHub\HostedComputeAgent\hosted-compute-agent")
+            if ($agent -ne [IntPtr]::Zero) { [W32]::ShowWindow($agent, 6) | Out-Null } # SW_MINIMIZE
+          } catch {}
+
+          # Bring RustDesk to front (try a few titles)
+          $titles = @("RustDesk","Remote Desktop","rustdesk")
+          $h = [IntPtr]::Zero
+          foreach ($t in $titles) { $h = [W32]::FindWindow($null, $t); if ($h -ne [IntPtr]::Zero) { break } }
+          if ($h -ne [IntPtr]::Zero) { [W32]::ShowWindow($h, 9) | Out-Null; [W32]::SetForegroundWindow($h) | Out-Null; Start-Sleep -Milliseconds 800 }
 
           Add-Type -AssemblyName System.Windows.Forms
           Add-Type -AssemblyName System.Drawing
-          $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
-          $bitmap = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
-          $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
-          $graphics.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
           $file = "$env:GITHUB_WORKSPACE\rdp-out\rustdesk-login-$($env:TS_HOSTNAME).png"
-          $bitmap.Save($file, [System.Drawing.Imaging.ImageFormat]::Png)
-          Write-Host "Saved screenshot: $file"
 
-      - name: Upload screenshot to GoFile (preview page, not direct download)
+          if ($h -ne [IntPtr]::Zero) {
+            $rect = New-Object W32+RECT
+            if ([W32]::GetWindowRect($h, [ref]$rect)) {
+              $w = $rect.Right - $rect.Left; $hgt = $rect.Bottom - $rect.Top
+              $bmp = New-Object System.Drawing.Bitmap $w, $hgt
+              $gfx = [System.Drawing.Graphics]::FromImage($bmp)
+              $gfx.CopyFromScreen([System.Drawing.Point]::new($rect.Left,$rect.Top), [System.Drawing.Point]::Empty, [System.Drawing.Size]::new($w,$hgt))
+              $bmp.Save($file, [System.Drawing.Imaging.ImageFormat]::Png)
+              Write-Host "Saved RustDesk window screenshot: $file"
+            } else { $h = [IntPtr]::Zero }
+          }
+
+          if ($h -eq [IntPtr]::Zero) {
+            $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+            $bmp = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
+            $gfx = [System.Drawing.Graphics]::FromImage($bmp)
+            $gfx.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
+            $bmp.Save($file, [System.Drawing.Imaging.ImageFormat]::Png)
+            Write-Host "Saved full-screen screenshot: $file"
+          }
+
+      - name: Zip outputs and upload to GoFile (DIRECT download link)
         run: |
-          $file = "$env:GITHUB_WORKSPACE\rdp-out\rustdesk-login-$($env:TS_HOSTNAME).png"
+          $zip = "$env:GITHUB_WORKSPACE\rustdesk-$($env:TS_HOSTNAME).zip"
+          if (Test-Path $zip) { Remove-Item $zip -Force }
+          Compress-Archive -Path "$env:GITHUB_WORKSPACE\rdp-out\*" -DestinationPath $zip -Force
           try {
-            # get best server, then upload
             $serverResp = Invoke-RestMethod -Uri "https://api.gofile.io/getServer" -UseBasicParsing
             $server = $serverResp.data.server
             $uploadUri = "https://$server.gofile.io/uploadFile"
-            $resp = Invoke-RestMethod -Uri $uploadUri -Method Post -Form @{ "file" = Get-Item $file } -UseBasicParsing
-            # use the downloadPage (web page) so it OPENS in browser instead of auto-downloading
-            $link = $resp.data.downloadPage
-            Write-Host "GoFile (preview) link: $link"
-            $link | Out-File "$env:GITHUB_WORKSPACE\rdp-out\rustdesk-login-link-$($env:TS_HOSTNAME).txt" -Encoding ascii
-            "Screenshot (GoFile preview): $link" | Out-File $env:GITHUB_STEP_SUMMARY -Append
+            $resp = Invoke-RestMethod -Uri $uploadUri -Method Post -Form @{ "file" = Get-Item $zip } -UseBasicParsing
+            $direct = $resp.data.directLink
+            if (-not $direct) { $direct = $resp.data.downloadPage }
+            "DIRECT ZIP: $direct" | Out-File $env:GITHUB_STEP_SUMMARY -Append
+            Write-Host "DIRECT ZIP: $direct"
+            $direct | Out-File "$env:GITHUB_WORKSPACE\rdp-out\gofile-direct-$($env:TS_HOSTNAME).txt" -Encoding ascii
           } catch {
             Write-Host "GoFile upload failed: $($_.Exception.Message)"
           }
 
-      - name: Upload RustDesk artifacts (ID, password, screenshot, link)
+      - name: Upload artifacts (ZIP + raw files)
         uses: actions/upload-artifact@v4
         with:
           name: rustdesk-${{ env.TS_HOSTNAME }}
-          path: rdp-out/
+          path: |
+            rdp-out/
+            rustdesk-${{ env.TS_HOSTNAME }}.zip
           if-no-files-found: ignore
 
       - name: Keep alive
