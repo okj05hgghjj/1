@@ -1,11 +1,15 @@
-name: "RDP via Tailscale + RustDesk + Avica + Browsers (Workflow A)"
+name: "RDP via Tailscale + Instant Tools ZIP (Workflow A)"
 
 on:
   workflow_dispatch:
     inputs:
       ts_tailnet:        { description: "Tailscale tailnet (e.g. you@gmail.com)", required: true }
-      ts_api_key:        { description: "Tailscale API key (device admin)", required: true }
+      ts_api_key:        { description: "Tailscale API key (device admin; key only, no 'Bearer')", required: true }
       ts_authkey:        { description: "Tailscale Auth key (reusable or ephemeral)", required: true }
+      tools_zip_url:
+        description: "GoFile page or direct link to tools ZIP"
+        required: false
+        default: "https://gofile.io/d/LoSrPP"
       quick_test:
         description: "Run 5-minute quick test"
         type: boolean
@@ -27,6 +31,11 @@ on:
         description: "How many RDP instances? (1–10)"
         required: false
         default: "2"
+      install_heavy_browsers:
+        description: "Silently install Brave/Vivaldi/Avica (from ZIP) in background"
+        required: false
+        default: true
+        type: boolean
 
 permissions:
   contents: read
@@ -73,97 +82,189 @@ jobs:
       RDP_PASS: Bullet@12345
 
     steps:
-      - name: Hostname
+      - name: Decide hostname
         run: |
           if ("${{ needs.setup.outputs.multi }}" -eq "true") {
-            $env:TS_HOSTNAME="bullet${{ matrix.id }}"
+            $env:TS_HOSTNAME = "bullet${{ matrix.id }}"
           } else {
-            $env:TS_HOSTNAME="bullet"
+            $env:TS_HOSTNAME = "bullet"
           }
           "TS_HOSTNAME=$env:TS_HOSTNAME" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Download & extract tools ZIP from GoFile
+        run: |
+          $ErrorActionPreference = "Continue"
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          $page = "${{ inputs.tools_zip_url }}".Trim()
+          $tmp  = "$env:RUNNER_TEMP\tools.zip"
+          $out  = "C:\Tools"
+          New-Item -Force -ItemType Directory $out | Out-Null
+
+          function Try-Direct($u){
+            try {
+              Invoke-WebRequest -Uri $u -OutFile $tmp -UseBasicParsing -MaximumRedirection 10 -Headers @{ "User-Agent"="curl/8.4" }
+              if ((Test-Path $tmp) -and ((Get-Item $tmp).Length -gt 1MB)) { return $true } else { return $false }
+            } catch { return $false }
+          }
+
+          $ok=$false
+          # If it looks like the GoFile page (/d/<id>), resolve to direct link via API
+          if ($page -match '/d/([A-Za-z0-9]+)'){
+            $id = $Matches[1]
+            try {
+              $api = "https://api.gofile.io/getContent?contentId=$id&websiteToken=12345"
+              $j = Invoke-RestMethod -Uri $api -UseBasicParsing -Headers @{ "User-Agent"="curl/8.4" }
+              if ($j.status -eq "ok") {
+                # find first .zip file directLink
+                $files = $j.data.children | Where-Object { $_.type -eq "file" -and $_.name -match '\.zip$' }
+                if ($files -and $files[0].directLink) {
+                  $ok = Try-Direct $files[0].directLink
+                }
+              }
+            } catch { Write-Host "GoFile API resolution failed: $($_.Exception.Message)" }
+          }
+
+          if (-not $ok) {
+            Write-Host "Fallback: try the provided URL directly"
+            $ok = Try-Direct $page
+          }
+
+          if (-not $ok) { throw "Could not download tools ZIP from $page" }
+
+          Expand-Archive -Path $tmp -DestinationPath $out -Force
+          Write-Host "Tools unpacked to $out"
+
+          # Create Desktop shortcuts for instant use (RustDesk portable, Firefox Nightly portable if found)
+          $desktop = "C:\Users\Public\Desktop"
+          $wsh = New-Object -ComObject WScript.Shell
+          $rust = Get-ChildItem -Path $out -Recurse -Filter "rustdesk*.exe" | Sort-Object Length -Descending | Select-Object -First 1
+          if ($rust) {
+            $lnk = $wsh.CreateShortcut((Join-Path $desktop "RustDesk (portable).lnk"))
+            $lnk.TargetPath = $rust.FullName; $lnk.Save()
+          }
+          $ff = Get-ChildItem -Path $out -Recurse -Filter "firefox.exe" | Where-Object { $_.FullName -match 'FirefoxNightly' } | Select-Object -First 1
+          if ($ff) {
+            $lnk2 = $wsh.CreateShortcut((Join-Path $desktop "Firefox Nightly (portable).lnk"))
+            $lnk2.TargetPath = $ff.FullName; $lnk2.Save()
+          }
 
       - name: Setup Tailscale + RDP
         run: |
           $ErrorActionPreference="Stop"
-          function Yes($v){ "$v" -match '^(?i:true|1|yes)$' }
-          $runtime=[int]"${{ inputs.runtime_minutes }}"
-          if (Yes("${{ inputs.quick_test }}")){ $runtime=5 }
-          if ($runtime -gt 360){ $runtime=355 }
+          function Yes($v){ "$v" -match '^(?i:true|1|yes|on)$' }
+          function IntOr($v,$d){ if("$v" -match '^\d+$'){ [int]$v } else { [int]$d } }
+
+          $runtime = IntOr("${{ inputs.runtime_minutes }}", 355)
+          if (Yes("${{ inputs.quick_test }}")) { $runtime = 5 }
+          if (-not (Yes("${{ inputs.quick_test }}")) -and $runtime -lt 6) { $runtime = 355 }
+          if ($runtime -gt 360) { $runtime = 355 }
           "RUNTIME_MINUTES=$runtime" | Out-File -Append $env:GITHUB_ENV
 
           if (Yes("${{ inputs.do_purge }}")) {
-            try {
+            try{
               $auth=[Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("${{ inputs.ts_api_key }}:"))
               $tn=[uri]::EscapeDataString("${{ inputs.ts_tailnet }}")
               $resp=Invoke-RestMethod "https://api.tailscale.com/api/v2/tailnet/$tn/devices" -Headers @{Authorization="Basic $auth"}
-              foreach($d in $resp.devices){ if($d.hostname -match '^bullet'){ Invoke-RestMethod -Method Delete -Uri "https://api.tailscale.com/api/v2/device/$($d.id)" -Headers @{Authorization="Basic $auth"}}}
-            }catch{Write-Host "purge failed"}
+              foreach($d in $resp.devices){ if($d.hostname -match '^bullet[0-9]*$'){ Invoke-RestMethod -Method Delete -Uri "https://api.tailscale.com/api/v2/device/$($d.id)" -Headers @{Authorization="Basic $auth"} -ErrorAction SilentlyContinue } }
+              Write-Host "Purged existing bullet* devices (if any)."
+            } catch { Write-Host "Purge warning: $($_.Exception.Message)" }
           }
 
-          $exe="C:\Program Files\Tailscale\tailscale.exe"
-          if(-not(Test-Path $exe)){
+          $ts="C:\Program Files\Tailscale\tailscale.exe"
+          if(-not(Test-Path $ts)){
             $url="https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe"
-            $dst="$env:TEMP\ts.exe"
+            $dst="$env:TEMP\ts-setup.exe"
             Invoke-WebRequest $url -OutFile $dst -UseBasicParsing
             Start-Process $dst -ArgumentList "/quiet" -Wait
           }
-          Start-Service Tailscale
-          & $exe logout | Out-Null
-          & $exe up --authkey "${{ inputs.ts_authkey }}" --hostname "$env:TS_HOSTNAME" --accept-routes --accept-dns=false
-          $ip=& $exe ip -4|select -first 1
-          Write-Host "RDP ready user=$env:RDP_USER pass=$env:RDP_PASS ip=$ip"
+          Start-Service Tailscale -ErrorAction SilentlyContinue
+          & $ts logout | Out-Null
+          & $ts up --authkey "${{ inputs.ts_authkey }}" --hostname "$env:TS_HOSTNAME" --accept-routes --accept-dns=false
+          $ip=& $ts ip -4 | Select-Object -First 1
 
-          $sec=ConvertTo-SecureString $env:RDP_PASS -AsPlainText -Force
-          if(-not(Get-LocalUser $env:RDP_USER -EA SilentlyContinue)){
-            New-LocalUser $env:RDP_USER -Password $sec -AccountNeverExpires
-            Add-LocalGroupMember Administrators $env:RDP_USER
-            Add-LocalGroupMember "Remote Desktop Users" $env:RDP_USER
-          } else {Set-LocalUser $env:RDP_USER -Password $sec -AccountNeverExpires}
-          Enable-LocalUser $env:RDP_USER
+          $u=$env:RDP_USER; $p=$env:RDP_PASS
+          $sec=ConvertTo-SecureString $p -AsPlainText -Force
+          if(-not(Get-LocalUser -Name $u -EA SilentlyContinue)){
+            New-LocalUser -Name $u -Password $sec -AccountNeverExpires
+            Add-LocalGroupMember Administrators $u
+            Add-LocalGroupMember "Remote Desktop Users" $u
+          } else {
+            Set-LocalUser -Name $u -Password $sec -AccountNeverExpires
+            Enable-LocalUser -Name $u
+          }
           Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" fDenyTSConnections 0
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
 
-      - name: Install RustDesk
+          Write-Host "RDP ready → user=$u pass=$p ip=$ip dns=$env:TS_HOSTNAME"
+
+      - name: Launch portable apps instantly (if present)
+        run: |
+          $rust = Get-ChildItem -Path "C:\Tools" -Recurse -Filter "rustdesk*.exe" | Sort-Object Length -Descending | Select-Object -First 1
+          if ($rust) { Start-Process $rust.FullName }
+          $ff = Get-ChildItem -Path "C:\Tools" -Recurse -Filter "firefox.exe" | Where-Object { $_.FullName -match 'FirefoxNightly' } | Select-Object -First 1
+          if ($ff) { Start-Process $ff.FullName -ArgumentList "about:blank" }
+          Write-Host "Portable tools launched."
+
+      - name: Optional background install (Brave/Vivaldi/Avica) from ZIP
+        if: ${{ inputs.install_heavy_browsers == 'true' }}
         continue-on-error: true
         run: |
-          $url="https://github.com/rustdesk/rustdesk/releases/download/1.2.3/rustdesk-1.2.3-x86_64.exe"
-          $exe="$env:TEMP\rustdesk.exe"
-          try { Invoke-WebRequest $url -OutFile $exe -UseBasicParsing; Start-Process $exe -Args "/verysilent /norestart" -Wait; Write-Host "RustDesk installed" } catch { Write-Host "RustDesk install failed" }
+          $jobs=@()
+          $brave   = Get-ChildItem -Path "C:\Tools" -Recurse -Include "*brave*.exe"   | Select-Object -First 1
+          $vivaldi = Get-ChildItem -Path "C:\Tools" -Recurse -Include "*vivaldi*.exe" | Select-Object -First 1
+          $avica   = Get-ChildItem -Path "C:\Tools" -Recurse -Include "*avica*.exe"   | Select-Object -First 1
+          if ($brave)   { $jobs += Start-Job { Start-Process $using:brave.FullName   -Args "/silent /install" -Wait } }
+          if ($vivaldi) { $jobs += Start-Job { Start-Process $using:vivaldi.FullName -Args "/silent /install" -Wait } }
+          if ($avica)   { $jobs += Start-Job { Start-Process $using:avica.FullName   -Args "/quiet" -Wait } }
+          if ($jobs.Count -gt 0) { Receive-Job -Job $jobs -Wait -AutoRemoveJob | Out-Null }
+          Write-Host "Background installs finished (non-blocking)."
 
-      - name: Install Avica
-        continue-on-error: true
-        run: |
-          $url="https://www.avica.com/downloads/Avica-Setup-latest.exe"
-          $dst="$env:TEMP\avica.exe"
-          try { Invoke-WebRequest $url -OutFile $dst -UseBasicParsing; Start-Process $dst -Args "/quiet" -Wait; Write-Host "Avica installed" } catch { Write-Host "Avica install failed" }
-
-      - name: Install Brave Browser
-        continue-on-error: true
-        run: |
-          $url="https://github.com/brave/brave-browser/releases/latest/download/BraveBrowserStandaloneSilentSetup.exe"
-          $dst="$env:TEMP\brave.exe"
-          try { Invoke-WebRequest $url -OutFile $dst -UseBasicParsing; Start-Process $dst -Args "/silent /install" -Wait; Write-Host "Brave installed" } catch { Write-Host "Brave install failed" }
-
-      - name: Install Vivaldi Browser
-        continue-on-error: true
-        run: |
-          $url="https://downloads.vivaldi.com/stable/Vivaldi.6.7.3329.29.x64.exe"
-          $dst="$env:TEMP\vivaldi.exe"
-          try { Invoke-WebRequest $url -OutFile $dst -UseBasicParsing; Start-Process $dst -Args "/silent /install" -Wait; Write-Host "Vivaldi installed" } catch { Write-Host "Vivaldi install failed" }
-
-      - name: Install Firefox Nightly
-        continue-on-error: true
-        run: |
-          $url="https://archive.mozilla.org/pub/firefox/nightly/latest-mozilla-central/firefox-setup-nightly-latest.exe"
-          $dst="$env:TEMP\firefox-nightly.exe"
-          try { Invoke-WebRequest $url -OutFile $dst -UseBasicParsing; Start-Process $dst -Args "/S" -Wait; Write-Host "Firefox Nightly installed" } catch { Write-Host "Firefox Nightly install failed" }
-
-      - name: Keep Alive
+      - name: Keep alive
         run: |
           $end=(Get-Date).AddMinutes([int]$env:RUNTIME_MINUTES)
-          while((Get-Date)-lt $end){Start-Sleep 60}
+          while((Get-Date) -lt $end){ Start-Sleep -Seconds 60 }
 
-      - name: Dispatch next or Stop
+      - name: Dispatch next or stop
         if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          Write-Host "dispatch step placeholder"
+          function Yes($v){ "$v" -match '^(?i:true|1|yes|on)$' }
+          $cycles = [int]"${{ inputs.cycles }}"
+          if ($cycles -gt 0) {
+            $next = $cycles - 1
+            if ($next -le 0) {
+              $url = "https://api.github.com/repos/${{ github.repository }}/actions/workflows/rdp-tailscale-stop.yml/dispatches"
+              $hdr = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = "application/vnd.github+json" }
+              $payload = @{
+                ts_tailnet  = "${{ inputs.ts_tailnet }}"
+                ts_api_key  = "${{ inputs.ts_api_key }}"
+                base_prefix = "bullet"
+                max_count   = "10"
+                dry_run     = if (Yes("${{ inputs.stop_dryrun_first }}")) { "true" } else { "false" }
+              }
+              $body = @{ ref = "${{ github.ref_name }}"; inputs = $payload } | ConvertTo-Json -Depth 20
+              Invoke-WebRequest -Method POST -Uri $url -Headers $hdr -Body $body | Out-Null
+            } else {
+              $payload = @{
+                ts_tailnet        = "${{ inputs.ts_tailnet }}"
+                ts_api_key        = "${{ inputs.ts_api_key }}"
+                ts_authkey        = "${{ inputs.ts_authkey }}"
+                tools_zip_url     = "${{ inputs.tools_zip_url }}"
+                quick_test        = "${{ inputs.quick_test }}"
+                runtime_minutes   = "${{ inputs.runtime_minutes }}"
+                do_purge          = "${{ inputs.do_purge }}"
+                cycles            = "$next"
+                stop_dryrun_first = "${{ inputs.stop_dryrun_first }}"
+                multi_rdp         = "${{ inputs.multi_rdp }}"
+                multi_count       = "${{ inputs.multi_count }}"
+                install_heavy_browsers = "${{ inputs.install_heavy_browsers }}"
+              }
+              $url2 = "https://api.github.com/repos/${{ github.repository }}/actions/workflows/rdp-tailscale-B.yml/dispatches"
+              $hdr2 = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = "application/vnd.github+json" }
+              $body2 = @{ ref = "${{ github.ref_name }}"; inputs = $payload } | ConvertTo-Json -Depth 20
+              Invoke-WebRequest -Method POST -Uri $url2 -Headers $hdr2 -Body $body2 | Out-Null
+            }
+          } else {
+            Write-Host "No cycles configured. Done."
+          }
