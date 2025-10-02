@@ -175,13 +175,17 @@ jobs:
             } else {
               try { & $rustdeskExe --install-service 2>$null | Out-Null } catch {}
               try { Start-Service -Name "RustDesk" -ErrorAction SilentlyContinue } catch {}
+
+              # start GUI once so we can screenshot it
               Start-Process -FilePath $rustdeskExe
               Start-Sleep -Seconds 8
+
+              # set unattended password
               try { & $rustdeskExe --password $pwdPlain 2>$null | Out-Null } catch {}
 
+              # get ID (CLI then file/log fallbacks)
               $id = ""
               try { $idOut = & $rustdeskExe --get-id 2>$null; if ($idOut) { $id = $idOut.Trim() } } catch {}
-
               if (-not $id) {
                 $idFiles = @(
                   "C:\ProgramData\RustDesk\id",
@@ -196,7 +200,6 @@ jobs:
                   }
                 }
               }
-
               if (-not $id) {
                 $candidates = @(
                   "C:\ProgramData\RustDesk",
@@ -236,74 +239,42 @@ jobs:
             Write-Host "RustDesk error: $($_.Exception.Message)"
           }
 
-      - name: Take RustDesk screenshot (window if possible)
+      - name: Take RustDesk screenshot (full screen, after focusing RustDesk)
         run: |
-          Add-Type @"
-using System;
-using System.Runtime.InteropServices;
-public class Win32 {
-  [DllImport("user32.dll")] public static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
-  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
-  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
-  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
-  public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
-}
-"@
+          $ErrorActionPreference = "SilentlyContinue"
+          # close any Tailscale UI window so it doesn't cover RustDesk
+          Get-Process | Where-Object { $_.MainWindowTitle -match 'Tailscale' } | Stop-Process -Force
+          Start-Sleep -Seconds 1
+          # try to bring RustDesk to front by re-launching
+          $exe1 = "C:\Program Files\RustDesk\rustdesk.exe"
+          $exe2 = "C:\Program Files (x86)\RustDesk\rustdesk.exe"
+          if (Test-Path $exe1) { Start-Process $exe1 } elseif (Test-Path $exe2) { Start-Process $exe2 }
+          Start-Sleep -Seconds 3
+
           Add-Type -AssemblyName System.Windows.Forms
           Add-Type -AssemblyName System.Drawing
-
-          $titles = @("RustDesk","Remote Desktop","rustdesk")
-          $hWnd = [IntPtr]::Zero
-          foreach ($t in $titles) {
-            $hWnd = [Win32]::FindWindow($null, $t)
-            if ($hWnd -ne [IntPtr]::Zero) { break }
-          }
-
+          $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+          $bitmap = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
+          $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+          $graphics.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
           $file = "$env:GITHUB_WORKSPACE\rdp-out\rustdesk-login-$($env:TS_HOSTNAME).png"
-          if ($hWnd -ne [IntPtr]::Zero) {
-            [Win32]::ShowWindow($hWnd, 9) | Out-Null
-            [Win32]::SetForegroundWindow($hWnd) | Out-Null
-            Start-Sleep -Milliseconds 800
-            $rect = New-Object Win32+RECT
-            if ([Win32]::GetWindowRect($hWnd, [ref]$rect)) {
-              $width  = $rect.Right - $rect.Left
-              $height = $rect.Bottom - $rect.Top
-              $bitmap = New-Object System.Drawing.Bitmap $width, $height
-              $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
-              $graphics.CopyFromScreen([System.Drawing.Point]::new($rect.Left,$rect.Top), [System.Drawing.Point]::Empty, [System.Drawing.Size]::new($width,$height))
-              $bitmap.Save($file, [System.Drawing.Imaging.ImageFormat]::Png)
-              Write-Host "Saved RustDesk window screenshot: $file"
-            } else {
-              Write-Host "GetWindowRect failed, fallback to full screen."
-              $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
-              $bitmap = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
-              $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
-              $graphics.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
-              $bitmap.Save($file, [System.Drawing.Imaging.ImageFormat]::Png)
-              Write-Host "Saved full-screen screenshot: $file"
-            }
-          } else {
-            Write-Host "RustDesk window not found, taking full-screen screenshot."
-            $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
-            $bitmap = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
-            $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
-            $graphics.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
-            $bitmap.Save($file, [System.Drawing.Imaging.ImageFormat]::Png)
-            Write-Host "Saved full-screen screenshot: $file"
-          }
+          $bitmap.Save($file, [System.Drawing.Imaging.ImageFormat]::Png)
+          Write-Host "Saved screenshot: $file"
 
-      - name: Upload screenshot to GoFile
+      - name: Upload screenshot to GoFile (preview page, not direct download)
         run: |
           $file = "$env:GITHUB_WORKSPACE\rdp-out\rustdesk-login-$($env:TS_HOSTNAME).png"
           try {
+            # get best server, then upload
             $serverResp = Invoke-RestMethod -Uri "https://api.gofile.io/getServer" -UseBasicParsing
             $server = $serverResp.data.server
             $uploadUri = "https://$server.gofile.io/uploadFile"
             $resp = Invoke-RestMethod -Uri $uploadUri -Method Post -Form @{ "file" = Get-Item $file } -UseBasicParsing
+            # use the downloadPage (web page) so it OPENS in browser instead of auto-downloading
             $link = $resp.data.downloadPage
-            Write-Host "GoFile link: $link"
+            Write-Host "GoFile (preview) link: $link"
             $link | Out-File "$env:GITHUB_WORKSPACE\rdp-out\rustdesk-login-link-$($env:TS_HOSTNAME).txt" -Encoding ascii
-            "Screenshot (GoFile): $link" | Out-File $env:GITHUB_STEP_SUMMARY -Append
+            "Screenshot (GoFile preview): $link" | Out-File $env:GITHUB_STEP_SUMMARY -Append
           } catch {
             Write-Host "GoFile upload failed: $($_.Exception.Message)"
           }
@@ -365,7 +336,6 @@ public class Win32 {
               Invoke-WebRequest -Method POST -Uri $url -Headers $hdr -Body $bodyPurge -UseBasicParsing | Out-Null
               exit 0
             }
-            else { $next = $next }
           } else { $next = 0 }
 
           $payload = @{
