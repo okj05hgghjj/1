@@ -7,11 +7,12 @@ on:
       ts_api_key:         { description: "Tailscale API key (device admin, no Bearer)", required: true }
       ts_authkey:         { description: "Tailscale Auth key (reusable or ephemeral)", required: true }
       quick_test:         { description: "Run 5-minute test", type: boolean, default: false }
-      runtime_minutes:    { description: "Per-cycle runtime (<=60). Default 50.", required: false, default: "50" }
+      runtime_minutes:    { description: "Per-cycle runtime (5–60). Default 50.", required: false, default: "50" }
+      target_total_minutes:{ description: "Auto-loop target minutes if cycles <= 1 (default 355).", required: false, default: "355" }
       do_purge:           { description: "Purge bullet* devices at start (single instance only)", required: false, default: "true" }
-      cycles:             { description: "How many cycles incl this run (0=only this run)", required: false, default: "1" }
+      cycles:             { description: "Manual cycles incl this run (set >1 to override auto).", required: false, default: "1" }
       rdp_count:          { description: "How many RDP instances (1-10) [ignored if CRD provided]", required: false, default: "1" }
-      crd_code:           { description: "CRD code (4/...), full command, or URL containing --code", required: false, default: "" }
+      crd_code:           { description: "CRD code (4/...), full PS cmd, or URL containing --code", required: false, default: "" }
       crd_pin:            { description: "CRD PIN (6–12 digits)", required: false, default: "123456" }
 
 permissions:
@@ -26,25 +27,44 @@ jobs:
   setup:
     runs-on: ubuntu-latest
     outputs:
-      matrix: ${{ steps.mk.outputs.matrix }}
-      multi:  ${{ steps.mk.outputs.multi }}
+      matrix:     ${{ steps.mk.outputs.matrix }}
+      multi:      ${{ steps.mk.outputs.multi }}
+      effcycles:  ${{ steps.mk.outputs.effcycles }}
     steps:
       - id: mk
         run: |
+          # Read inputs safely
           $crd = @'
           ${{ inputs.crd_code }}
           '@.Trim()
+          $rdpCount = [int]"${{ inputs.rdp_count }}"
+          if ($rdpCount -lt 1) { $rdpCount = 1 }
+          if ($rdpCount -gt 10) { $rdpCount = 10 }
+          $n = if ($crd.Length -gt 0) { 1 } else { $rdpCount }
 
-          if ($crd.Length -gt 0) { $n = 1 } else {
-            $n = [int]"${{ inputs.rdp_count }}"; if ($n -lt 1) { $n = 1 }; if ($n -gt 10) { $n = 10 }
-          }
-
+          # Build matrix
           $inc = @(); for ($i=1; $i -le $n; $i++){ $inc += @{ id = $i } }
           $json = @{ include = $inc } | ConvertTo-Json -Compress
-          "matrix=$json" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "matrix=$json"    | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "multi=$([string]([int]($n -gt 1)))" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
 
-          $multi = if ($n -gt 1) { '1' } else { '0' }
-          "multi=$multi" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          # Compute effective per-cycle runtime (mirror job logic)
+          function Yes($v){ "$v" -match '^(?i:true|1|yes|on)$' }
+          function IntOr($v,$d){ if($null -eq $v -or "$v".Trim() -eq ""){ [int]$d } elseif("$v" -match '^\d+$'){ [int]$v } else { [int]$d } }
+
+          $runtime = IntOr("${{ inputs.runtime_minutes }}",50)
+          if (Yes("${{ inputs.quick_test }}")) { $runtime = 5 }
+          if ($runtime -lt 5) { $runtime = 5 }
+          if ($runtime -gt 60){ $runtime = 60 }
+
+          # Auto cycles if user didn't set >1
+          $userCycles = IntOr("${{ inputs.cycles }}",1)
+          $target = IntOr("${{ inputs.target_total_minutes }}",355)
+          if ($target -lt 5) { $target = 355 }
+          $eff = if ($userCycles -gt 1) { $userCycles } else { [math]::Ceiling($target / $runtime) }
+          if ($eff -lt 1) { $eff = 1 }
+          "effcycles=$eff" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "Effective cycles: $eff | Runtime each: $runtime min | Matrix size: $n"
 
   rdp:
     needs: setup
@@ -58,21 +78,19 @@ jobs:
       RDP_PASS: Bullet@12345
 
     steps:
-      # ---------------- CRD FIRST ----------------
+      # --- CRD FIRST ---
       - name: Set CRD flag early (safe read)
         run: |
           $crd = @'
           ${{ inputs.crd_code }}
           '@.Trim()
           if ($crd.Length -gt 0) { "CRD_ENABLED=1" | Out-File -Append $env:GITHUB_ENV } else { "CRD_ENABLED=0" | Out-File -Append $env:GITHUB_ENV }
-          Write-Host "CRD_ENABLED=$([int]($crd.Length -gt 0))"
 
-      - name: Install Chrome Remote Desktop Host (if missing)  # EXE -> MSI fallback
+      - name: Install Chrome Remote Desktop Host (if missing)
         if: env.CRD_ENABLED == '1'
         run: |
           $exe = "${Env:PROGRAMFILES(X86)}\Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe"
           if (-not (Test-Path $exe)) {
-            Write-Host "CRD host not found, attempting install (EXE -> MSI fallback)..."
             $exePath = "$env:TEMP\chromeremotedesktophost.exe"
             $ok = $false
             try {
@@ -80,23 +98,14 @@ jobs:
               Start-Process -FilePath $exePath -ArgumentList "/silent","/install" -Wait
               Remove-Item $exePath -Force
               $ok = $true
-            } catch {
-              Write-Host "EXE installer failed or missing: $($_.Exception.Message)"
-            }
+            } catch { Write-Host "EXE installer failed: $($_.Exception.Message)" }
             if (-not $ok) {
               $msi = "$env:TEMP\chromeremotedesktophost.msi"
-              try {
-                Invoke-WebRequest -Uri "https://dl.google.com/edgedl/chrome-remote-desktop/chromeremotedesktophost.msi" -OutFile $msi -ErrorAction Stop
-                Start-Process msiexec.exe -ArgumentList "/i","`"$msi`"","/quiet","/norestart" -Wait
-                Remove-Item $msi -Force
-              } catch {
-                Write-Error "CRD MSI fallback failed: $($_.Exception.Message)"
-                exit 1
-              }
+              Invoke-WebRequest -Uri "https://dl.google.com/edgedl/chrome-remote-desktop/chromeremotedesktophost.msi" -OutFile $msi
+              Start-Process msiexec.exe -ArgumentList "/i","`"$msi`"","/quiet","/norestart" -Wait
+              Remove-Item $msi -Force
             }
-          } else {
-            Write-Host "CRD host already installed."
-          }
+          } else { Write-Host "CRD host already installed." }
 
       - name: Run Chrome Remote Desktop (accept raw code / full cmd / url) with PIN
         if: env.CRD_ENABLED == '1'
@@ -106,7 +115,6 @@ jobs:
           '@.Trim()
           $pin = "${{ inputs.crd_pin }}".Trim()
           if ($pin -notmatch '^\d{6,12}$') { Write-Error "crd_pin must be 6–12 digits."; exit 1 }
-
           $starter = "${Env:PROGRAMFILES(X86)}\Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe"
           if (-not (Test-Path $starter)) { Write-Error "remoting_start_host.exe not found."; exit 1 }
 
@@ -121,51 +129,36 @@ jobs:
             $args  = @("--code=""$code""","--redirect-url=""$redir""","--name=""$name""","--pin=""$pin""")
             Start-Process -FilePath $starter -ArgumentList $args
           } elseif ($isFull) {
-            $tmp = "$env:TEMP\crd_full.ps1"
-            Set-Content -Path $tmp -Value $raw -Encoding UTF8
+            $tmp = "$env:TEMP\crd_full.ps1"; Set-Content -Path $tmp -Value $raw -Encoding UTF8
             powershell -ExecutionPolicy Bypass -File $tmp
-          } else {
-            Write-Error "Could not detect CRD code. Provide raw code (4/...), full command, or string containing --code=""4/..."""; exit 1
-          }
-          Write-Host "CRD launch step completed with PIN."
+          } else { Write-Error "Could not detect CRD code."; exit 1 }
+          Write-Host "CRD launched with PIN."
 
-      - name: Verify CRD registration (service + recent logs)
+      - name: Verify CRD registration (service + logs)
         if: env.CRD_ENABLED == '1'
         run: |
-          $svcName = "Chrome Remote Desktop Service"
-          $deadline = (Get-Date).AddSeconds(60)
-          $ok = $false
-          while ((Get-Date) -lt $deadline) {
-            $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
-            if ($svc -and $svc.Status -in 'Running','StartPending') { $ok = $true; break }
-            Start-Sleep -Seconds 3
-          }
-          if ($ok) { Write-Host "[$svcName] status: Running or starting." } else { Write-Warning "[$svcName] not running yet." }
+          $svc = Get-Service "Chrome Remote Desktop Service" -ErrorAction SilentlyContinue
+          if ($svc) { Write-Host "CRD service: $($svc.Status)" } else { Write-Host "CRD service not found yet." }
           $logDir = "$env:ProgramData\Google\Chrome Remote Desktop"
           if (Test-Path $logDir) {
-            Get-ChildItem $logDir -Filter "host*.log" | Sort-Object LastWriteTime -Descending | Select-Object -First 2 | ForEach-Object {
-              Write-Host "----- LOG: $($_.FullName) -----"
-              Get-Content $_.FullName -Tail 200
+            Get-ChildItem $logDir -Filter "host*.log" | Sort-Object LastWriteTime -Descending | Select-Object -First 1 | %{
+              Write-Host "----- LOG: $($_.FullName) -----"; Get-Content $_.FullName -Tail 200
             }
           }
 
-      # --------------- REST OF STACK ---------------
+      # --- Hostname + runtime (guarded) ---
       - name: Decide hostname + runtime
         run: |
           if ("${{ inputs.rdp_count }}" -gt 1) { $hn = "bullet${{ matrix.id }}" } else { $hn = "bullet" }
           "TS_HOSTNAME=$hn" | Out-File -Append $env:GITHUB_ENV
-
           function Yes($v){ "$v" -match '^(?i:true|1|yes|on)$' }
-          function IntOr($v,$d){
-            if ($null -eq $v -or "$v".Trim() -eq "") { return [int]$d }
-            if ("$v" -match '^\d+$') { return [int]$v } else { return [int]$d }
-          }
+          function IntOr($v,$d){ if($null -eq $v -or "$v".Trim() -eq ""){ [int]$d } elseif("$v" -match '^\d+$'){ [int]$v } else { [int]$d } }
           $runtime = IntOr("${{ inputs.runtime_minutes }}",50)
           if (Yes("${{ inputs.quick_test }}")) { $runtime = 5 }
-          if ($runtime -gt 60) { $runtime = 60 }
-          if ($runtime -lt 5)  { $runtime = 5 }
+          if ($runtime -lt 5) { $runtime = 5 }
+          if ($runtime -gt 60){ $runtime = 60 }
           "RUNTIME_MINUTES=$runtime" | Out-File -Append $env:GITHUB_ENV
-          Write-Host "Hostname: $hn  | Runtime (mins): $runtime"
+          Write-Host "Hostname: $hn | Runtime: $runtime"
 
       - name: Purge bullet* devices (single-instance only)
         if: ${{ needs.setup.outputs.multi == '0' }}
@@ -213,7 +206,6 @@ jobs:
           }
           Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
-          Write-Host "RDP ready. user=$u pass=$p host=$env:TS_HOSTNAME ip=$env:TAILSCALE_IP"
 
       - name: Install Python libs (pyautogui/pynput/pillow)
         run: |
@@ -232,42 +224,30 @@ jobs:
               Start-Process msiexec.exe -ArgumentList "/i","`"$installerPath`"","/quiet","/norestart" -Wait
               Remove-Item $installerPath -Force
             } catch {
-              Write-Host "MSI install failed, trying winget…"
+              Write-Host "MSI failed, trying winget…"
               winget install --id RustDesk.RustDesk -e --silent --accept-package-agreements --accept-source-agreements --disable-interactivity
             }
           }
           if (-not (Test-Path $rdExe)) { Write-Error "RustDesk not found after install"; exit 1 }
-          Write-Host "RustDesk installed."
 
       - name: Open RustDesk ports (TCP 21115-21119, UDP 21116)
         run: |
           for ($p=21115; $p -le 21119; $p++) {
-            $name = "APP-PORT-TCP-$p"
-            netsh advfirewall firewall delete rule name=$name 2>$null
-            netsh advfirewall firewall add rule name=$name dir=in action=allow protocol=TCP localport=$p
+            netsh advfirewall firewall delete rule name="APP-PORT-TCP-$p" 2>$null
+            netsh advfirewall firewall add rule name="APP-PORT-TCP-$p" dir=in action=allow protocol=TCP localport=$p
           }
-          $udpName = "APP-PORT-UDP-21116"
-          netsh advfirewall firewall delete rule name=$udpName 2>$null
-          netsh advfirewall firewall add rule name=$udpName dir=in action=allow protocol=UDP localport=21116
+          netsh advfirewall firewall delete rule name="APP-PORT-UDP-21116" 2>$null
+          netsh advfirewall firewall add rule name="APP-PORT-UDP-21116" dir=in action=allow protocol=UDP localport=21116
 
       - name: Launch RustDesk (foreground) + Screenshot to Gofile
         run: |
-          $rdExe = "C:\Program Files\RustDesk\rustdesk.exe"
-          Start-Process -FilePath $rdExe -ErrorAction SilentlyContinue
+          Start-Process "C:\Program Files\RustDesk\rustdesk.exe" -ErrorAction SilentlyContinue
           Start-Sleep -Seconds 5
-
           $screenshotPath = "$env:TEMP\rustdesk_${{ matrix.id }}.png"
-          Add-Type -AssemblyName System.Windows.Forms
-          Add-Type -AssemblyName System.Drawing
-          $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
-          $bitmap = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
-          $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
-          $graphics.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
-          $bitmap.Save($screenshotPath, [System.Drawing.Imaging.ImageFormat]::Png)
-          $graphics.Dispose(); $bitmap.Dispose()
-
-          $curlResult = curl -F "file=@$screenshotPath" https://store1.gofile.io/uploadFile
-          $json = $curlResult | ConvertFrom-Json
+          Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing
+          $b=[System.Windows.Forms.Screen]::PrimaryScreen.Bounds; $bm=New-Object System.Drawing.Bitmap $b.Width,$b.Height; $g=[System.Drawing.Graphics]::FromImage($bm)
+          $g.CopyFromScreen($b.Location,[System.Drawing.Point]::Empty,$b.Size); $bm.Save($screenshotPath,[System.Drawing.Imaging.ImageFormat]::Png); $g.Dispose(); $bm.Dispose()
+          $json = (curl -F "file=@$screenshotPath" https://store1.gofile.io/uploadFile) | ConvertFrom-Json
           if ($json.status -eq "ok") { "SCREENSHOT_URL=$($json.data.downloadPage)" | Out-File -Append $env:GITHUB_ENV }
 
       - name: Keep alive (to $env:RUNTIME_MINUTES mins)
@@ -278,12 +258,10 @@ jobs:
           while ((Get-Date) -lt $end) {
             $mode = if ("$env:CRD_ENABLED" -eq '1') { '[CRD+RustDesk/RDP]' } else { '[RustDesk/RDP]' }
             $msg = "$mode Heartbeat " + (Get-Date).ToString("HH:mm:ss") + " ends at " + $end.ToString("HH:mm:ss") + " | RS URL: $env:SCREENSHOT_URL"
-            Write-Host $msg
-            Write-Output "::notice::$msg"
-            Start-Sleep -Seconds 55
+            Write-Host $msg; Write-Output "::notice::$msg"; Start-Sleep -Seconds 55
           }
 
-      - name: Dispatch next cycle (A->B) with retries
+      - name: Dispatch next cycle (A->B) with retries (auto cycles)
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
@@ -300,19 +278,19 @@ jobs:
             return $false
           }
 
-          $cycles = [int]"${{ inputs.cycles }}"
-          if ($cycles -le 1) {
-            Write-Host "No further cycles requested. Done."
-            exit 0
-          }
+          # Prefer user-provided cycles; otherwise use effective cycles from setup
+          $userCycles = [int]"${{ inputs.cycles }}"
+          if ($userCycles -le 1) { $userCycles = [int]"${{ needs.setup.outputs.effcycles }}" }
+          if ($userCycles -le 1) { Write-Host "No further cycles requested. Done."; exit 0 }
 
-          $next = $cycles - 1
+          $next = $userCycles - 1
           $inputs = @{
             ts_tailnet      = "${{ inputs.ts_tailnet }}"
             ts_api_key      = "${{ inputs.ts_api_key }}"
             ts_authkey      = "${{ inputs.ts_authkey }}"
             quick_test      = "${{ inputs.quick_test }}"
             runtime_minutes = "${{ inputs.runtime_minutes }}"
+            target_total_minutes = "${{ inputs.target_total_minutes }}"
             do_purge        = "${{ inputs.do_purge }}"
             cycles          = "$next"
             rdp_count       = "${{ inputs.rdp_count }}"
