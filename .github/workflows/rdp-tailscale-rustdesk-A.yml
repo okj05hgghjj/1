@@ -7,9 +7,9 @@ on:
       ts_api_key:         { description: "Tailscale API key (device admin, no Bearer)", required: true }
       ts_authkey:         { description: "Tailscale Auth key (reusable or ephemeral)", required: true }
       quick_test:         { description: "Run 5-minute test", type: boolean, default: false }
-      runtime_minutes:    { description: "Runtime (max 360; default 355 when not test)", required: false, default: "355" }
+      runtime_minutes:    { description: "Per-cycle runtime (<=60). Default 50.", required: false, default: "50" }
       do_purge:           { description: "Purge bullet* devices at start (single instance only)", required: false, default: "true" }
-      cycles:             { description: "0=stop after A; N=handoffs left incl this run", required: false, default: "0" }
+      cycles:             { description: "How many cycles incl this run (0=only this run)", required: false, default: "1" }
       rdp_count:          { description: "How many RDP instances (1-10) [ignored if CRD provided]", required: false, default: "1" }
       crd_code:
         description: >-
@@ -35,16 +35,14 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.mk.outputs.matrix }}
-      multi:  ${{ steps.mk.outputs.multi }}   # expose single vs multi
+      multi:  ${{ steps.mk.outputs.multi }}
     steps:
       - id: mk
         run: |
-          # Safe literal read (so full commands with &, quotes, ${Env:...} don't break)
           $crd = @'
           ${{ inputs.crd_code }}
           '@.Trim()
 
-          # If CRD provided -> force single; else use rdp_count (1..10)
           if ($crd.Length -gt 0) { $n = 1 } else {
             $n = [int]"${{ inputs.rdp_count }}"; if ($n -lt 1) { $n = 1 }; if ($n -gt 10) { $n = 10 }
           }
@@ -53,7 +51,6 @@ jobs:
           $json = @{ include = $inc } | ConvertTo-Json -Compress
           "matrix=$json" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
 
-          # NEW: multi flag
           $multi = if ($n -gt 1) { '1' } else { '0' }
           "multi=$multi" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
 
@@ -63,7 +60,7 @@ jobs:
     strategy:
       matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
       max-parallel: 10
-    timeout-minutes: 370
+    timeout-minutes: 60   # hard cap per cycle
     env:
       RDP_USER: Bullettemporary
       RDP_PASS: Bullet@12345
@@ -105,9 +102,7 @@ jobs:
                 exit 1
               }
             }
-          } else {
-            Write-Host "CRD host already installed."
-          }
+          } else { Write-Host "CRD host already installed." }
 
       - name: Run Chrome Remote Desktop (accept raw code / full cmd / url) with PIN
         if: env.CRD_ENABLED == '1'
@@ -132,13 +127,11 @@ jobs:
             $args  = @("--code=""$code""","--redirect-url=""$redir""","--name=""$name""","--pin=""$pin""")
             Start-Process -FilePath $starter -ArgumentList $args
           } elseif ($isFull) {
-            # Last resort: run as-is (might prompt if it lacks --pin)
             $tmp = "$env:TEMP\crd_full.ps1"
             Set-Content -Path $tmp -Value $raw -Encoding UTF8
             powershell -ExecutionPolicy Bypass -File $tmp
           } else {
-            Write-Error "Could not detect CRD code. Provide raw code (4/...), full command, or string containing --code=\"4/...\""
-            exit 1
+            Write-Error "Could not detect CRD code. Provide raw code (4/...), full command, or string containing --code=""4/..."""; exit 1
           }
           Write-Host "CRD launch step completed with PIN."
 
@@ -154,16 +147,13 @@ jobs:
             Start-Sleep -Seconds 3
           }
           if ($ok) { Write-Host "[$svcName] status: Running or starting." } else { Write-Warning "[$svcName] not running yet." }
-
           $logDir = "$env:ProgramData\Google\Chrome Remote Desktop"
           if (Test-Path $logDir) {
-            Get-ChildItem $logDir -Filter "host*.log" | Sort-Object LastWriteTime -Descending | Select-Object -First 2 | ForEach-Object {
-              Write-Host "----- LOG: $($_.FullName) -----"
-              Get-Content $_.FullName -Tail 200
+            Get-ChildItem $logDir -Filter "host*.log" | Sort-Object LastWriteTime -Descending | Select-Object -First 2 | %{
+              Write-Host "----- LOG: $($_.FullName) -----"; Get-Content $_.FullName -Tail 200
             }
           } else { Write-Host "CRD log directory not found: $logDir" }
 
-      # --- Continue with the rest after CRD is launched ---
       - name: Decide hostname + runtime
         run: |
           if ("${{ inputs.rdp_count }}" -gt 1) { $hn = "bullet${{ matrix.id }}" } else { $hn = "bullet" }
@@ -171,14 +161,12 @@ jobs:
 
           function Yes($v){ "$v" -match '^(?i:true|1|yes|on)$' }
           function IntOr($v,$d){ if("$v" -match '^\d+$'){ [int]$v } else { [int]$d } }
-          $runtime = IntOr("${{ inputs.runtime_minutes }}",355)
+          $runtime = IntOr("${{ inputs.runtime_minutes }}",50)
           if (Yes("${{ inputs.quick_test }}")) { $runtime = 5 }
-          if (-not (Yes("${{ inputs.quick_test }}")) -and $runtime -lt 6) { $runtime = 355 }
-          if ($runtime -gt 360) { $runtime = 355 }
+          if ($runtime -gt 60) { $runtime = 60 }
           "RUNTIME_MINUTES=$runtime" | Out-File -Append $env:GITHUB_ENV
           Write-Host "Hostname: $hn  | Runtime: $runtime"
 
-      # ---------- PURGE only for SINGLE INSTANCE ----------
       - name: Purge bullet* devices (single-instance only)
         if: ${{ needs.setup.outputs.multi == '0' }}
         run: |
@@ -188,16 +176,10 @@ jobs:
               $auth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("${{ inputs.ts_api_key }}:"))
               $tn = [uri]::EscapeDataString("${{ inputs.ts_tailnet }}")
               $list = Invoke-RestMethod -Uri "https://api.tailscale.com/api/v2/tailnet/$tn/devices" -Headers @{ Authorization = "Basic $auth" }
-              foreach($d in $list.devices){
-                if ($d.hostname -match '^bullet[0-9]*$'){
-                  Invoke-RestMethod -Method Delete -Uri "https://api.tailscale.com/api/v2/device/$($d.id)" -Headers @{ Authorization = "Basic $auth" } -ErrorAction SilentlyContinue
-                }
-              }
+              foreach($d in $list.devices){ if ($d.hostname -match '^bullet[0-9]*$'){ Invoke-RestMethod -Method Delete -Uri "https://api.tailscale.com/api/v2/device/$($d.id)" -Headers @{ Authorization = "Basic $auth" } -EA SilentlyContinue } }
               Write-Host "Purged bullet* devices (if any)."
             } catch { Write-Host "Purge warning: $($_.Exception.Message)" }
-          } else {
-            Write-Host "Purge disabled."
-          }
+          } else { Write-Host "Purge disabled (multi-instance)." }
 
       - name: Install + Up Tailscale
         run: |
@@ -294,42 +276,52 @@ jobs:
           $end = (Get-Date).AddMinutes($mins)
           while ((Get-Date) -lt $end) {
             $mode = if ("$env:CRD_ENABLED" -eq '1') { '[CRD+RustDesk/RDP]' } else { '[RustDesk/RDP]' }
-            Write-Host ("$mode Heartbeat " + (Get-Date).ToString("HH:mm:ss") + " ends at " + $end.ToString("HH:mm:ss") + " | RS URL: $env:SCREENSHOT_URL")
-            Start-Sleep -Seconds 60
+            $msg = "$mode Heartbeat " + (Get-Date).ToString("HH:mm:ss") + " ends at " + $end.ToString("HH:mm:ss") + " | RS URL: $env:SCREENSHOT_URL"
+            Write-Host $msg
+            Write-Output "::notice::$msg"
+            Start-Sleep -Seconds 55
           }
 
-      - name: Dispatch next or stop
+      - name: Dispatch next cycle (A->B) with retries
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $cycles = [int]"${{ inputs.cycles }}"
-          if ($cycles -gt 0) {
-            $next = $cycles - 1
-            if ($next -le 0) {
-              $url = "https://api.github.com/repos/${{ github.repository }}/actions/workflows/rdp-tailscale-stop.yml/dispatches"
-              $hdr = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = "application/vnd.github+json" }
-              $payload = @{ ts_tailnet="${{ inputs.ts_tailnet }}"; ts_api_key="${{ inputs.ts_api_key }}"; base_prefix="bullet"; max_count="10"; dry_run="false" }
-              $body = @{ ref="${{ github.ref_name }}"; inputs=$payload } | ConvertTo-Json -Depth 20
-              Invoke-WebRequest -Method POST -Uri $url -Headers $hdr -Body $body | Out-Null
-              Write-Host "Dispatched STOP."
-            } else {
-              $payload = @{
-                ts_tailnet      = "${{ inputs.ts_tailnet }}"
-                ts_api_key      = "${{ inputs.ts_api_key }}"
-                ts_authkey      = "${{ inputs.ts_authkey }}"
-                quick_test      = "${{ inputs.quick_test }}"
-                runtime_minutes = "${{ inputs.runtime_minutes }}"
-                do_purge        = "${{ inputs.do_purge }}"
-                cycles          = "$next"
-                rdp_count       = "${{ inputs.rdp_count }}"
-                crd_code        = "${{ inputs.crd_code }}"
-                crd_pin         = "${{ inputs.crd_pin }}"
-              }
-              $url2 = "https://api.github.com/repos/${{ github.repository }}/actions/workflows/rdp-tailscale-B.yml/dispatches"
-              $hdr2 = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = "application/vnd.github+json" }
-              $body2 = @{ ref="${{ github.ref_name }}"; inputs=$payload } | ConvertTo-Json -Depth 20
-              Invoke-WebRequest -Method POST -Uri $url2 -Headers $hdr2 -Body $body2 | Out-Null
-              Write-Host "Dispatched Workflow B with cycles=$next"
+          function Dispatch-WithRetry([string]$wf, [object]$payloadJson) {
+            $url = "https://api.github.com/repos/${{ github.repository }}/actions/workflows/$wf/dispatches"
+            $hdr = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = "application/vnd.github+json" }
+            for ($i=1; $i -le 5; $i++) {
+              try {
+                $resp = Invoke-WebRequest -Method POST -Uri $url -Headers $hdr -Body $payloadJson -TimeoutSec 30 -ErrorAction Stop
+                if ($resp.StatusCode -in 201, 204) { Write-Host "Dispatch to $wf ok (attempt $i)."; return $true }
+              } catch { Write-Host "Dispatch to $wf failed (attempt $i): $($_.Exception.Message)"; Start-Sleep -Seconds (5*$i) }
             }
-          } else { Write-Host "No cycles configured. Done." }
+            return $false
+          }
+
+          $cycles = [int]"${{ inputs.cycles }}"
+          if ($cycles -le 1) {
+            Write-Host "No further cycles requested. Done."
+            exit 0
+          }
+
+          $next = $cycles - 1
+          $inputs = @{
+            ts_tailnet      = "${{ inputs.ts_tailnet }}"
+            ts_api_key      = "${{ inputs.ts_api_key }}"
+            ts_authkey      = "${{ inputs.ts_authkey }}"
+            quick_test      = "${{ inputs.quick_test }}"
+            runtime_minutes = "${{ inputs.runtime_minutes }}"
+            do_purge        = "${{ inputs.do_purge }}"
+            cycles          = "$next"
+            rdp_count       = "${{ inputs.rdp_count }}"
+            crd_code        = "${{ inputs.crd_code }}"
+            crd_pin         = "${{ inputs.crd_pin }}"
+          }
+          $body = @{ ref="${{ github.ref_name }}"; inputs=$inputs } | ConvertTo-Json -Depth 20
+
+          $ok = Dispatch-WithRetry "rdp-tailscale-rustdesk-B.yml" $body
+          if (-not $ok) {
+            Write-Warning "B dispatch failed after retries. Fallback: self-dispatch A."
+            [void](Dispatch-WithRetry "rdp-tailscale-rustdesk-A.yml" $body)
+          }
